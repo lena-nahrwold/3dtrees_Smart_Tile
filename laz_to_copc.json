@@ -1,0 +1,12 @@
+[
+    {
+        "type": "readers.las",
+        "filename": "${input_laz}"
+    },
+    {
+        "type": "writers.copc",
+        "filename": "${output_copc}",
+        "threads": "${threads}"
+    }
+]
+
