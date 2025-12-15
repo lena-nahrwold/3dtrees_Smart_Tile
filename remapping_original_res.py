@@ -5,7 +5,7 @@ import laspy
 import os
 
 
-def main(original_file, subsampled_file, output_file):
+def main(original_file, subsampled_file, output_file, num_threads=-1):
     """
     Remap predicted attributes from a subsampled point cloud back to the original resolution point cloud.
 
@@ -19,7 +19,10 @@ def main(original_file, subsampled_file, output_file):
         original_file (str): Path to the original resolution LAS/LAZ file.
         subsampled_file (str): Path to the subsampled LAS/LAZ file with predicted attributes.
         output_file (str): Path to save the updated original LAS/LAZ file.
+        num_threads (int): Number of threads for KDTree queries (-1 for all CPUs).
     """
+    print(f"Using {num_threads} threads for processing" + (" (all CPUs)" if num_threads == -1 else ""))
+    
     # Load the original point cloud with parallel LAZ reading
     original_las = laspy.read(original_file, laz_backend=laspy.LazBackend.LazrsParallel)
     original_points = np.vstack((original_las.x, original_las.y, original_las.z)).T
@@ -55,7 +58,8 @@ def main(original_file, subsampled_file, output_file):
     tree = KDTree(subsampled_points)
 
     # Find the nearest neighbors in the subsampled point cloud for each point in the original point cloud
-    distances, indices = tree.query(original_points, workers=-1)
+    print(f"Querying nearest neighbors with {num_threads} workers...")
+    distances, indices = tree.query(original_points, workers=num_threads)
 
     # Map attributes from the subsampled point cloud to the original point cloud
     print("Mapping attributes to original point cloud...")
@@ -96,6 +100,12 @@ if __name__ == "__main__":
         type=str,
         help="Path to save the updated original point cloud file",
     )
+    parser.add_argument(
+        "--num_threads",
+        type=int,
+        default=-1,
+        help="Number of threads for KDTree queries (-1 for all CPUs, default: -1)",
+    )
     args = parser.parse_args()
 
-    main(args.original_file, args.subsampled_file, args.output_file)
+    main(args.original_file, args.subsampled_file, args.output_file, args.num_threads)

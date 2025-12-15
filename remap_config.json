@@ -1,6 +1,0 @@
-{
-    "input": "/home/kg281/data/test_remap/subsampled/tile_-1_-2_subsampled10m.laz",
-    "output": "/home/kg281/data/test_remap",
-    "temp": "/home/kg281/data/test_remap/tmp",
-    "pipeline": "/home/kg281/projects/3dtrees_smart_tile/remap_pipeline.json"
-}
