@@ -2,6 +2,8 @@
 
 Merge overlapping segmented point cloud tiles into a single homogeneous point cloud with consistent instance IDs.
 
+TreeDivNet: For the data processing the data was tiled into 200m & 300m tiles with an overlap of 30m in each direction.  
+
 ## Overview
 
 The tile merger takes **overlapping segmented LAZ tiles** (with potentially different instance segmentations in overlap regions) and produces a **single merged point cloud** where:
