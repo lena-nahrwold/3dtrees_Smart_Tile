@@ -151,13 +151,16 @@ def find_spatial_neighbors(
     tolerance: float = 1.0
 ) -> Dict[str, Optional[str]]:
     """
-    Find neighboring tiles based on spatial boundaries.
+    Find neighboring tiles based on actual spatial overlaps.
+    
+    Detects neighbors by checking if tiles overlap spatially (not just aligned edges).
+    This handles cases where tiles extend into each other by buffer meters.
     
     Args:
         tile_boundary: (minx, maxx, miny, maxy) of the current tile
         tile_name: Name of the current tile
         all_tiles: Dictionary mapping tile names to their boundaries
-        tolerance: Maximum distance for edges to be considered shared (default: 1.0m)
+        tolerance: Minimum overlap distance to consider tiles as neighbors (default: 1.0m)
     
     Returns:
         Dictionary with 'east', 'west', 'north', 'south' -> neighbor_name or None
@@ -171,34 +174,66 @@ def find_spatial_neighbors(
         "south": None
     }
     
+    # Track overlaps for each direction to pick the best neighbor
+    east_overlaps = []  # (overlap_area, other_name)
+    west_overlaps = []
+    north_overlaps = []
+    south_overlaps = []
+    
     for other_name, (minx_b, maxx_b, miny_b, maxy_b) in all_tiles.items():
         if other_name == tile_name:
             continue
         
-        # Check if tiles share an edge
-        # East neighbor: other tile's left edge aligns with this tile's right edge
-        if abs(minx_b - maxx_a) <= tolerance:
+        # Check for actual spatial overlap (not just edge alignment)
+        overlap = find_overlap_region(tile_boundary, (minx_b, maxx_b, miny_b, maxy_b))
+        if overlap is None:
+            continue
+        
+        overlap_minx, overlap_maxx, overlap_miny, overlap_maxy = overlap
+        overlap_width = overlap_maxx - overlap_minx
+        overlap_height = overlap_maxy - overlap_miny
+        overlap_area = overlap_width * overlap_height
+        
+        # Determine which edge(s) the overlap is on
+        # Check if overlap is significant enough (at least tolerance meters)
+        
+        # East neighbor: other tile extends to the right (east) of this tile
+        # The overlap should be on the right side of this tile
+        if minx_b > minx_a and overlap_width >= tolerance:
             # Check if there's vertical overlap
             if not (maxy_b < miny_a or miny_b > maxy_a):
-                neighbors["east"] = other_name
+                east_overlaps.append((overlap_area, other_name))
         
-        # West neighbor: other tile's right edge aligns with this tile's left edge
-        elif abs(maxx_b - minx_a) <= tolerance:
+        # West neighbor: other tile extends to the left (west) of this tile
+        # The overlap should be on the left side of this tile
+        if maxx_b < maxx_a and overlap_width >= tolerance:
             # Check if there's vertical overlap
             if not (maxy_b < miny_a or miny_b > maxy_a):
-                neighbors["west"] = other_name
+                west_overlaps.append((overlap_area, other_name))
         
-        # North neighbor: other tile's bottom edge aligns with this tile's top edge
-        elif abs(miny_b - maxy_a) <= tolerance:
+        # North neighbor: other tile extends above (north) of this tile
+        # The overlap should be on the top side of this tile
+        if miny_b > miny_a and overlap_height >= tolerance:
             # Check if there's horizontal overlap
             if not (maxx_b < minx_a or minx_b > maxx_a):
-                neighbors["north"] = other_name
+                north_overlaps.append((overlap_area, other_name))
         
-        # South neighbor: other tile's top edge aligns with this tile's bottom edge
-        elif abs(maxy_b - miny_a) <= tolerance:
+        # South neighbor: other tile extends below (south) of this tile
+        # The overlap should be on the bottom side of this tile
+        if maxy_b < maxy_a and overlap_height >= tolerance:
             # Check if there's horizontal overlap
             if not (maxx_b < minx_a or minx_b > maxx_a):
-                neighbors["south"] = other_name
+                south_overlaps.append((overlap_area, other_name))
+    
+    # Pick the neighbor with the largest overlap for each direction
+    if east_overlaps:
+        neighbors["east"] = max(east_overlaps, key=lambda x: x[0])[1]
+    if west_overlaps:
+        neighbors["west"] = max(west_overlaps, key=lambda x: x[0])[1]
+    if north_overlaps:
+        neighbors["north"] = max(north_overlaps, key=lambda x: x[0])[1]
+    if south_overlaps:
+        neighbors["south"] = max(south_overlaps, key=lambda x: x[0])[1]
     
     return neighbors
 
@@ -212,7 +247,7 @@ def filter_by_centroid_in_buffer(
     buffer: float = 10.0,
 ) -> Tuple[Set[int], Dict[int, str]]:
     """
-    Find instances whose centroid is in the buffer zone on inner edges.
+    Find instances whose centroid is in the buffer zone on overlapping edges.
     Uses vectorized centroid computation for efficiency.
 
     Args:
@@ -221,7 +256,7 @@ def filter_by_centroid_in_buffer(
         boundary: (min_x, max_x, min_y, max_y) of the tile
         tile_name: Name of the tile (e.g., "c00_r00")
         all_tiles: Dictionary mapping tile names to their boundaries for neighbor detection
-        buffer: Buffer distance from inner edges
+        buffer: Buffer distance from inner edges (also used as minimum overlap to consider)
 
     Returns:
         Tuple of:
@@ -232,7 +267,7 @@ def filter_by_centroid_in_buffer(
     min_x, max_x, min_y, max_y = boundary
 
     # Determine which edges have neighbors using spatial bounds
-    neighbors = find_spatial_neighbors(boundary, tile_name, all_tiles)
+    neighbors = find_spatial_neighbors(boundary, tile_name, all_tiles, tolerance=buffer)
 
     # Calculate tile dimensions and cap buffer
     tile_width = max_x - min_x
@@ -241,7 +276,8 @@ def filter_by_centroid_in_buffer(
     actual_buffer = min(buffer, min_dimension * 0.4)
     actual_buffer = max(actual_buffer, 2.0)
 
-    # Define buffer zone boundaries (only on inner edges)
+    # Define buffer zone boundaries (only on edges with neighbors)
+    # Simple approach: buffer meters from each edge that has a neighbor
     buf_min_x = min_x + (actual_buffer if neighbors["west"] is not None else 0)
     buf_max_x = max_x - (actual_buffer if neighbors["east"] is not None else 0)
     buf_min_y = min_y + (actual_buffer if neighbors["south"] is not None else 0)
@@ -410,6 +446,27 @@ def _load_tile_wrapper(args):
     """
     filepath, tile_boundaries, buffer = args
     return load_tile(filepath, tile_boundaries, buffer)
+
+
+def _compute_hull_wrapper(args):
+    """
+    Wrapper function for convex hull computation to make it pickleable for ProcessPoolExecutor.
+    
+    Args:
+        args: Tuple of (points, bbox_volume)
+    
+    Returns:
+        Tuple of (volume, success) where success is True if hull computation succeeded
+    """
+    from scipy.spatial import ConvexHull
+    
+    points, bbox_volume = args
+    try:
+        hull = ConvexHull(points)
+        return (hull.volume, True)
+    except Exception:
+        # If hull fails, use bounding box volume as fallback
+        return (bbox_volume, False)
 
 
 # =============================================================================
@@ -836,9 +893,11 @@ def merge_small_volume_instances(
     species_prob: Optional[np.ndarray],
     instance_species_map: Dict[int, int],
     instance_species_prob_map: Dict[int, float],
-    max_points_for_check: int = 10000,
+    min_points_for_hull_check: int = 1000,
+    min_points_for_redistribute: int = 500,
     max_volume_for_merge: float = 4.0,
     max_search_radius: float = 5.0,
+    num_threads: int = 1,
     verbose: bool = True,
 ) -> Tuple[
     np.ndarray, np.ndarray, Optional[np.ndarray], Dict[int, int], Dict[int, float], int
@@ -846,9 +905,13 @@ def merge_small_volume_instances(
     """
     Merge small-volume instances to nearest large instance by centroid distance.
 
-    For instances with < max_points_for_check points:
-    1. Calculate convex hull volume
-    2. If volume < max_volume_for_merge, merge to nearest large instance centroid
+    Logic:
+    - For instances with >= min_points_for_hull_check (1000) points: Keep instance (skip hull computation)
+    - For instances with < min_points_for_hull_check (1000) points:
+      1. Calculate convex hull volume
+      2. If volume < max_volume_for_merge (4.0 m³): Merge to nearest large instance
+      3. Else if point_count < min_points_for_redistribute (500): Redistribute to nearest instance
+      4. Else: Keep instance
 
     Species ID and species_prob are taken from the target (larger) instance.
 
@@ -859,15 +922,16 @@ def merge_small_volume_instances(
         species_prob: Array of species probabilities (modified in-place, optional)
         instance_species_map: Mapping of instance ID to species ID
         instance_species_prob_map: Mapping of instance ID to species probability
-        max_points_for_check: Only check instances with fewer points than this
-        max_volume_for_merge: Merge instances with convex hull volume below this (m³)
-        max_search_radius: Max distance to search for target instance (m)
-        verbose: Print detailed decisions
+        min_points_for_hull_check: Only compute convex hull for instances with fewer points than this (default: 1000)
+        min_points_for_redistribute: Redistribute instances with fewer points than this if volume >= threshold (default: 500)
+        max_volume_for_merge: Merge instances with convex hull volume below this (m³) (default: 4.0)
+        max_search_radius: Max distance to search for target instance (m) (default: 5.0)
+        num_threads: Number of workers for parallel hull computation (default: 1)
+        verbose: Print detailed decisions (default: True)
 
     Returns:
-        Updated (instances, species_ids, species_prob, instance_species_map, instance_species_prob_map)
+        Updated (instances, species_ids, species_prob, instance_species_map, instance_species_prob_map, bbox_skipped_count)
     """
-    from scipy.spatial import ConvexHull
 
     # Sort points by instance for efficient slicing - O(n log n) once
     sort_idx = np.argsort(instances)
@@ -886,16 +950,29 @@ def merge_small_volume_instances(
     inst_counts = inst_counts[pos_mask]
 
     # Categorize instances and compute volumes using sorted slices
-    # Optimization: Use bounding box volume as fast pre-filter before expensive convex hull
+    # Optimization: Only compute convex hull for instances < min_points_for_hull_check (1000 points)
+    # Optimization: Only compute centroids for instances < 1000 points after bbox filtering
+    # First pass: collect candidates that need hull computation (after bbox filter)
+    hull_candidates = []  # (inst_id, count, start, end, bbox_volume) - no centroid/points yet
     small_volume_instances = []  # (inst_id, point_count, volume, centroid)
+    small_point_count_instances = []  # (inst_id, point_count, centroid) - for redistribution
     large_instances = []  # (inst_id, count, centroid)
     bbox_skipped_count = 0  # Track instances skipped by bounding box filter
 
-    for inst_id, start, count in zip(unique_inst, first_idx, inst_counts):
+    total_instances = len(unique_inst)
+    if verbose:
+        print(f"  Processing {total_instances:,} instances...")
+
+    for idx, (inst_id, start, count) in enumerate(zip(unique_inst, first_idx, inst_counts)):
         count = int(count)
 
-        # Skip large instances (by point count) - they're kept
-        if count >= max_points_for_check:
+        # Progress print every 1000 instances or every 10%
+        if verbose and (idx % 1000 == 0 or idx == total_instances // 10 or idx == total_instances - 1):
+            progress = (idx + 1) * 100.0 / total_instances
+            print(f"    Progress: {idx + 1:,}/{total_instances:,} instances ({progress:.1f}%)...")
+
+        # Skip large instances (>= min_points_for_hull_check) - they're kept (no hull computation)
+        if count >= min_points_for_hull_check:
             end = start + count
             centroid = sorted_points[start:end].mean(axis=0)
             large_instances.append((inst_id, count, centroid))
@@ -908,18 +985,21 @@ def merge_small_volume_instances(
             large_instances.append((inst_id, count, centroid))
             continue
 
-        # Get points from sorted slice
+        # For instances < 1000 points: compute bbox volume without extracting points array
+        # This avoids memory copies for instances that will be filtered out
         end = start + count
-        pts = sorted_points[start:end]
-        centroid = pts.mean(axis=0)
-
-        # Fast pre-filter: Check bounding box volume first (much faster than convex hull)
-        bbox_volume = np.prod(pts.max(axis=0) - pts.min(axis=0))
+        # Compute bbox volume directly from slice (no need to copy points array)
+        bbox_volume = np.prod(
+            sorted_points[start:end].max(axis=0) - sorted_points[start:end].min(axis=0)
+        )
 
         # If bounding box volume is already too large, skip convex hull computation
+        # Note: We still need centroid for large_instances, so compute it here
         if (
             bbox_volume >= max_volume_for_merge * 4.0
         ):  # Conservative threshold (bbox >= 4x target)
+            # Only compute centroid if we're keeping this instance
+            centroid = sorted_points[start:end].mean(axis=0)
             large_instances.append((inst_id, count, centroid))
             bbox_skipped_count += 1
             if verbose:
@@ -928,30 +1008,101 @@ def merge_small_volume_instances(
                 )
             continue
 
-        # Only compute expensive convex hull if bounding box suggests it might be small
-        try:
-            hull = ConvexHull(pts)
-            volume = hull.volume
-        except Exception:
-            # If hull fails, use bounding box volume as fallback
-            volume = bbox_volume
+        # Collect candidates for hull computation (< min_points_for_hull_check, passed bbox filter)
+        # Store indices instead of points/centroid to avoid memory overhead
+        # We'll compute centroids only for instances that pass hull computation
+        hull_candidates.append((inst_id, count, start, end, bbox_volume))
 
-        # Check volume threshold
-        if volume < max_volume_for_merge:
-            small_volume_instances.append((inst_id, count, volume, centroid))
-            if verbose:
-                print(
-                    f"    Instance {inst_id}: {count} pts, {volume:.2f} m³ - SMALL (< {max_volume_for_merge} m³)"
-                )
+    if verbose:
+        print(f"  Categorized instances: {len(large_instances):,} large, {bbox_skipped_count:,} skipped (large bbox), {len(hull_candidates):,} need hull computation")
+
+    # Parallel convex hull computation for candidates using --workers (num_threads)
+    # Now compute centroids and extract points only for hull candidates
+    if len(hull_candidates) > 0:
+        if verbose:
+            print(f"  Computing centroids and convex hulls for {len(hull_candidates):,} instances (< {min_points_for_hull_check} points)...")
+            if num_threads > 1:
+                print(f"    Using {num_threads} workers (--workers={num_threads}) for parallel processing...")
+        
+        # Extract points and compute centroids only for hull candidates
+        # This avoids memory overhead for instances filtered by bbox
+        hull_args = []
+        hull_centroids = []
+        for inst_id, count, start, end, bbox_volume in hull_candidates:
+            pts = sorted_points[start:end]  # Only extract points for hull candidates
+            centroid = pts.mean(axis=0)  # Only compute centroids for hull candidates
+            hull_args.append((pts, bbox_volume))
+            hull_centroids.append(centroid)
+        
+        # Use --workers (num_threads) for parallelization
+        # Parallelize if num_threads > 1 and we have enough candidates
+        use_parallel = num_threads > 1 and len(hull_candidates) > 10
+        if use_parallel:
+            # Parallel computation using ProcessPoolExecutor with progress updates
+            batch_size = max(100, len(hull_args) // 20)  # ~20 progress updates
+            hull_results = []
+            
+            with ProcessPoolExecutor(max_workers=num_threads) as executor:
+                for batch_idx in range(0, len(hull_args), batch_size):
+                    batch = hull_args[batch_idx:batch_idx + batch_size]
+                    batch_results = list(executor.map(_compute_hull_wrapper, batch))
+                    hull_results.extend(batch_results)
+                    
+                    if verbose:
+                        progress = min(100.0, (len(hull_results) * 100.0 / len(hull_candidates)))
+                        print(f"    Hull progress: {len(hull_results):,}/{len(hull_candidates):,} ({progress:.1f}%)...")
         else:
-            large_instances.append((inst_id, count, centroid))
-            if verbose:
-                print(
-                    f"    Instance {inst_id}: {count} pts, {volume:.2f} m³ - keeping (volume ok)"
-                )
+            # Sequential computation for small batches or single thread with progress updates
+            if verbose and num_threads == 1:
+                print(f"    Using sequential computation (--workers=1 or <10 candidates)...")
+            hull_results = []
+            for idx, args in enumerate(hull_args):
+                result = _compute_hull_wrapper(args)
+                hull_results.append(result)
+                
+                if verbose and (idx % 100 == 0 or idx == len(hull_args) - 1):
+                    progress = (idx + 1) * 100.0 / len(hull_candidates)
+                    print(f"    Hull progress: {idx + 1:,}/{len(hull_candidates):,} ({progress:.1f}%)...")
+        
+        # Process hull computation results
+        if verbose:
+            print(f"  Processing hull results and categorizing instances...")
+            
+        for (inst_id, count, start, end, bbox_volume), (volume, hull_success), centroid in zip(hull_candidates, hull_results, hull_centroids):
+            if verbose and not hull_success:
+                print(f"    Instance {inst_id}: hull computation failed, using bbox volume")
+            
+            # Check volume threshold
+            if volume < max_volume_for_merge:
+                # Small volume - merge to nearest instance
+                small_volume_instances.append((inst_id, count, volume, centroid))
+                if verbose:
+                    print(
+                        f"    Instance {inst_id}: {count} pts, {volume:.2f} m³ - SMALL (< {max_volume_for_merge} m³) - merge"
+                    )
+            else:
+                # Volume >= threshold - check point count for redistribution
+                if count < min_points_for_redistribute:
+                    # Small point count - redistribute to nearest instance
+                    small_point_count_instances.append((inst_id, count, centroid))
+                    if verbose:
+                        print(
+                            f"    Instance {inst_id}: {count} pts, {volume:.2f} m³ - REDISTRIBUTE (< {min_points_for_redistribute} pts)"
+                        )
+                else:
+                    # Keep instance
+                    large_instances.append((inst_id, count, centroid))
+                    if verbose:
+                        print(
+                            f"    Instance {inst_id}: {count} pts, {volume:.2f} m³ - keeping (volume ok, enough points)"
+                        )
 
-    if len(small_volume_instances) == 0:
-        print(f"  No small-volume instances to merge")
+    # Combine small volume and small point count instances for merging/redistribution
+    all_small_instances = small_volume_instances + [(inst_id, count, 0.0, centroid) 
+                                                     for inst_id, count, centroid in small_point_count_instances]
+    
+    if len(all_small_instances) == 0:
+        print(f"  No small instances to merge/redistribute")
         if bbox_skipped_count > 0:
             print(
                 f"  Skipped {bbox_skipped_count} instances using bounding box filter (bbox >= {max_volume_for_merge * 4.0:.1f} m³)"
@@ -962,7 +1113,6 @@ def merge_small_volume_instances(
             species_prob,
             instance_species_map,
             instance_species_prob_map,
-            bbox_skipped_count,
             bbox_skipped_count,
         )
 
@@ -979,12 +1129,15 @@ def merge_small_volume_instances(
             instance_species_map,
             instance_species_prob_map,
             bbox_skipped_count,
-            bbox_skipped_count,
         )
 
     print(
-        f"  Found {len(small_volume_instances)} small-volume instances (< {max_volume_for_merge} m³)"
+        f"  Found {len(small_volume_instances)} small-volume instances (< {max_volume_for_merge} m³) to merge"
     )
+    if len(small_point_count_instances) > 0:
+        print(
+            f"  Found {len(small_point_count_instances)} small point-count instances (< {min_points_for_redistribute} pts, volume >= {max_volume_for_merge} m³) to redistribute"
+        )
     if bbox_skipped_count > 0:
         print(
             f"  Skipped {bbox_skipped_count} instances using bounding box filter (bbox >= {max_volume_for_merge * 4.0:.1f} m³) - saved convex hull computation"
@@ -1010,25 +1163,30 @@ def merge_small_volume_instances(
         if inst_id < max_inst:
             inst_to_species_prob[inst_id] = prob
 
-    # Determine targets for small-volume instances
+    # Determine targets for small instances (volume-based merge and point-count-based redistribute)
     # Optimization: Batch KD-tree queries for better cache efficiency
-    if len(small_volume_instances) > 0:
+    if len(all_small_instances) > 0:
         small_centroids = np.array(
-            [centroid for _, _, _, centroid in small_volume_instances]
+            [centroid for _, _, _, centroid in all_small_instances]
         )
         distances, indices = tree.query(small_centroids)
 
         # Process results
         total_merged = 0
-        for i, (inst_id, count, volume, centroid) in enumerate(small_volume_instances):
+        for i, (inst_id, count, volume, centroid) in enumerate(all_small_instances):
             distance = distances[i]
             idx = indices[i]
 
             if distance > max_search_radius:
                 if verbose:
-                    print(
-                        f"    Cluster {inst_id}: {count} pts, {volume:.2f} m³ → no target within {max_search_radius}m (nearest: {distance:.1f}m)"
-                    )
+                    if volume > 0:  # Small volume instance
+                        print(
+                            f"    Cluster {inst_id}: {count} pts, {volume:.2f} m³ → no target within {max_search_radius}m (nearest: {distance:.1f}m)"
+                        )
+                    else:  # Small point count instance
+                        print(
+                            f"    Cluster {inst_id}: {count} pts → no target within {max_search_radius}m (nearest: {distance:.1f}m)"
+                        )
                 continue
 
             target_inst = large_ids[idx]
@@ -1041,9 +1199,14 @@ def merge_small_volume_instances(
             inst_to_species_prob[inst_id] = target_species_prob
 
             total_merged += count
-            print(
-                f"    Cluster {inst_id} ({count} pts, {volume:.2f} m³) → Instance {target_inst} ({large_sizes[target_inst]} pts, dist: {distance:.1f}m)"
-            )
+            if volume > 0:  # Small volume instance
+                print(
+                    f"    Cluster {inst_id} ({count} pts, {volume:.2f} m³) → Instance {target_inst} ({large_sizes[target_inst]} pts, dist: {distance:.1f}m)"
+                )
+            else:  # Small point count instance
+                print(
+                    f"    Cluster {inst_id} ({count} pts) → Instance {target_inst} ({large_sizes[target_inst]} pts, dist: {distance:.1f}m) - redistributed"
+                )
     else:
         total_merged = 0
 
@@ -1055,7 +1218,8 @@ def merge_small_volume_instances(
         species_prob[valid_mask] = inst_to_species_prob[instances[valid_mask]]
 
     print(
-        f"  Merged {total_merged:,} points from {len(small_volume_instances)} small-volume instances"
+        f"  Merged/redistributed {total_merged:,} points from {len(all_small_instances)} small instances "
+        f"({len(small_volume_instances)} small-volume + {len(small_point_count_instances)} small point-count)"
     )
 
     return (
@@ -1529,18 +1693,58 @@ def merge_tiles(
         opposites = {"east": "west", "west": "east", "north": "south", "south": "north"}
         return opposites.get(direction, direction)
     
-    def bboxes_overlap(bbox_a: Tuple[float, float, float, float], bbox_b: Tuple[float, float, float, float]) -> bool:
-        """Check if two bounding boxes overlap."""
+    def bboxes_overlap(bbox_a: Tuple[float, float, float, float], bbox_b: Tuple[float, float, float, float], tolerance: float = 0.1) -> bool:
+        """
+        Check if two bounding boxes overlap or are within tolerance distance.
+        
+        Args:
+            bbox_a: (minx, maxx, miny, maxy) of first bounding box
+            bbox_b: (minx, maxx, miny, maxy) of second bounding box
+            tolerance: Maximum distance between boxes to still consider them (default: 0.1m = 10cm)
+        
+        Returns:
+            True if boxes overlap or are within tolerance distance
+        """
         minx_a, maxx_a, miny_a, maxy_a = bbox_a
         minx_b, maxx_b, miny_b, maxy_b = bbox_b
-        return not (maxx_a < minx_b or minx_a > maxx_b or maxy_a < miny_b or miny_a > maxy_b)
+        
+        # Check if boxes overlap (original check)
+        if not (maxx_a < minx_b or minx_a > maxx_b or maxy_a < miny_b or miny_a > maxy_b):
+            return True
+        
+        # Check if boxes are within tolerance distance (almost touching)
+        # Compute gaps in X and Y dimensions
+        # If boxes don't overlap, find the minimum separation
+        x_gap = 0.0
+        if maxx_a < minx_b:
+            x_gap = minx_b - maxx_a  # A is to the left of B
+        elif maxx_b < minx_a:
+            x_gap = minx_a - maxx_b  # B is to the left of A
+        # else: they overlap in X, x_gap = 0
+        
+        y_gap = 0.0
+        if maxy_a < miny_b:
+            y_gap = miny_b - maxy_a  # A is below B
+        elif maxy_b < miny_a:
+            y_gap = miny_a - maxy_b  # B is below A
+        # else: they overlap in Y, y_gap = 0
+        
+        # Minimum separation is the diagonal distance between closest corners
+        # For non-overlapping boxes: √(x_gap² + y_gap²)
+        # But if boxes overlap in one dimension, we use the gap in the other dimension
+        separation = np.sqrt(x_gap * x_gap + y_gap * y_gap)
+        
+        return separation <= tolerance
 
     # =========================================================================
     # Stage 2.5: Border Region Instance Matching
     # =========================================================================
+    # Note: Cross-tile matching is optimized - each tile pair is checked exactly once
+    # using `for j in range(i + 1, len(tiles))`, avoiding duplicate A->B and B->A checks.
     print(f"\n{'=' * 60}")
     print("Stage 2.5: Border Region Instance Matching")
     print(f"{'=' * 60}")
+    print(f"  Finding border region instances (centroids in buffer to buffer+10m zone)...")
     
     # Find border region instances (centroids in buffer to buffer+10m zone)
     border_instances = {}  # tile_name -> {instance_id: {'centroid': [...], 'points': [...], 'boundary': [...]}}
@@ -1549,6 +1753,7 @@ def merge_tiles(
     tile_name_to_idx = {tile.name: idx for idx, tile in enumerate(tiles)}
     
     for tile_idx, tile in enumerate(tiles):
+        print(f"    Processing tile {tile_idx + 1}/{len(tiles)}: {tile.name} ({len(tile.points):,} points)...")
         tile_name = tile.name
         neighbors = find_spatial_neighbors(tile.boundary, tile_name, tile_boundaries)
         kept_instances = kept_instances_per_tile[tile_name]
@@ -1576,15 +1781,25 @@ def merge_tiles(
         
         border_instances[tile_name] = {}
         
-        # Find instances with centroids in border region
-        unique_ids = np.unique(tile.instances)
-        for inst_id in unique_ids:
-            if inst_id <= 0 or inst_id not in kept_instances:
+        # OPTIMIZATION: Use vectorized centroid computation instead of per-instance loops
+        # This is O(n log n) instead of O(k * n) where k = number of instances
+        print(f"      Computing centroids for all instances (vectorized)...")
+        all_centroids = compute_centroids_vectorized(tile.points, tile.instances)
+        
+        # Filter to kept instances only
+        kept_ids_array = np.array(sorted(kept_instances), dtype=tile.instances.dtype)
+        
+        print(f"      Checking {len(kept_ids_array)} kept instances for border region membership...")
+        border_count = 0
+        
+        # For border region instances, we still need to extract points and compute bboxes
+        # But we can use the pre-computed centroids first to filter candidates
+        for inst_id in kept_ids_array:
+            if inst_id <= 0 or inst_id not in all_centroids:
                 continue
             
-            mask = tile.instances == inst_id
-            inst_points = tile.points[mask]
-            centroid = np.mean(inst_points, axis=0)
+            # Use pre-computed centroid (fast - O(1) lookup)
+            centroid = all_centroids[inst_id]
             cx, cy = centroid[0], centroid[1]
             
             # Check if centroid is in border region (between buffer and buffer+10m)
@@ -1609,6 +1824,10 @@ def merge_tiles(
                     border_direction = "north"
             
             if in_border_region:
+                # Only now extract points and compute bbox (only for border instances)
+                mask = tile.instances == inst_id
+                inst_points = tile.points[mask]
+                
                 # Compute instance bounding box
                 inst_minx = inst_points[:, 0].min()
                 inst_maxx = inst_points[:, 0].max()
@@ -1622,13 +1841,25 @@ def merge_tiles(
                     'direction': border_direction,
                     'tile_idx': tile_idx
                 }
+                border_count += 1
+        
+        print(f"      Found {border_count} border region instances in {tile.name}")
     
     # Match border region instances between neighbor tiles
     total_border_insts = sum(len(insts) for insts in border_instances.values())
     tiles_with_border = len([t for t in border_instances if border_instances[t]])
     print(f"  Found {total_border_insts} border region instances across {tiles_with_border} tiles")
+    print(f"  Processing tile pairs...")
+    
+    # Track which global IDs have already been matched to avoid duplicate checks
+    matched_gids = set()
     
     border_matches = 0
+    total_bbox_checks = 0
+    total_centroid_checks = 0
+    total_ff3d_computations = 0
+    tiles_processed = 0
+    
     for i in range(len(tiles)):
         tile_a = tiles[i]
         neighbors_a = find_spatial_neighbors(tile_a.boundary, tile_a.name, tile_boundaries)
@@ -1657,20 +1888,83 @@ def merge_tiles(
             if not border_insts_a or not border_insts_b:
                 continue
             
-            # Check overlap for each pair
+            # Progress: Show which tile pair is being processed
+            matches_before = border_matches
+            print(f"    Checking {tile_a.name} ({direction}) <-> {tile_b.name} ({get_opposite_direction(direction)}): "
+                  f"{len(border_insts_a)} vs {len(border_insts_b)} border instances", end=" ... ")
+            
+            # Build KDTree from tile B centroids for fast spatial lookup
+            # Only for instances not already matched
+            centroids_b_list = []
+            inst_ids_b_list = []
+            gids_b_list = []
+            
+            for inst_id_b, data_b in border_insts_b.items():
+                gid_b = global_id(tile_b_idx, inst_id_b)
+                # Skip if already matched (avoid redundant checks)
+                if gid_b not in matched_gids:
+                    centroids_b_list.append(data_b['centroid'])
+                    inst_ids_b_list.append(inst_id_b)
+                    gids_b_list.append(gid_b)
+            
+            if not centroids_b_list:
+                continue
+            
+            centroids_b_array = np.array(centroids_b_list)
+            tree_b = cKDTree(centroids_b_array)
+            
+            # For each instance in tile A, find nearby instances in tile B using KDTree
             for inst_id_a, data_a in border_insts_a.items():
                 gid_a = global_id(i, inst_id_a)
                 
-                for inst_id_b, data_b in border_insts_b.items():
-                    gid_b = global_id(tile_b_idx, inst_id_b)
+                # Skip if already matched
+                if gid_a in matched_gids:
+                    continue
+                
+                centroid_a = data_a['centroid']
+                bbox_a = data_a['boundary']
+                
+                # Query KDTree to find instances within max_centroid_distance
+                # This dramatically reduces the number of pairs to check
+                k = min(len(centroids_b_list), 10)
+                if k == 1:
+                    # Single result: query returns scalar
+                    distance, idx = tree_b.query(centroid_a, k=1, distance_upper_bound=max_centroid_distance)
+                    if np.isfinite(distance):
+                        candidate_indices = [idx]
+                        candidate_distances = [distance]
+                    else:
+                        candidate_indices = []
+                        candidate_distances = []
+                else:
+                    # Multiple results: query returns arrays
+                    distances, indices = tree_b.query(centroid_a, k=k, distance_upper_bound=max_centroid_distance)
+                    # Filter to valid results (within distance, not inf)
+                    valid_mask = np.isfinite(distances)
+                    candidate_indices = indices[valid_mask].tolist()
+                    candidate_distances = distances[valid_mask].tolist()
+                
+                total_centroid_checks += len(candidate_indices)
+                
+                # Check each candidate pair
+                for idx, dist in zip(candidate_indices, candidate_distances):
+                    inst_id_b = inst_ids_b_list[idx]
+                    gid_b = gids_b_list[idx]
                     
-                    # Check bounding box overlap first (quick check)
-                    bbox_a = data_a['boundary']
-                    bbox_b = data_b['boundary']
-                    if not bboxes_overlap(bbox_a, bbox_b):
+                    # Skip if already matched
+                    if gid_b in matched_gids:
                         continue
                     
-                    # Compute overlap ratio using FF3D method
+                    data_b = border_insts_b[inst_id_b]
+                    bbox_b = data_b['boundary']
+                    
+                    # Quick bounding box overlap/nearby check (within 10cm tolerance)
+                    total_bbox_checks += 1
+                    if not bboxes_overlap(bbox_a, bbox_b, tolerance=0.1):
+                        continue
+                    
+                    # Now compute expensive FF3D overlap ratio
+                    total_ff3d_computations += 1
                     points_a = data_a['points']
                     points_b = data_b['points']
                     instances_a = np.full(len(points_a), inst_id_a, dtype=np.int32)
@@ -1685,11 +1979,26 @@ def merge_tiles(
                     if overlap_ratio >= overlap_threshold:
                         # Merge via Union-Find
                         root = uf.union(gid_a, gid_b)
+                        matched_gids.add(gid_a)
+                        matched_gids.add(gid_b)
                         border_matches += 1
                         if verbose:
-                            print(f"    Border match: {tile_a.name}:{inst_id_a} <-> {tile_b.name}:{inst_id_b} (overlap: {overlap_ratio:.3f})")
+                            print(f"      ✓ Match: {tile_a.name}:{inst_id_a} <-> {tile_b.name}:{inst_id_b} (overlap: {overlap_ratio:.3f}, dist: {dist:.2f}m)")
+            
+            # Progress: Show results for this tile pair
+            matches_this_pair = border_matches - matches_before
+            if matches_this_pair > 0:
+                print(f"{matches_this_pair} match(es) found")
+            else:
+                print("no matches")
+            tiles_processed += 1
+            
+            # Periodic progress update every 10 tile pairs
+            if tiles_processed % 10 == 0:
+                print(f"  Progress: {tiles_processed} tile pairs processed, {border_matches} total matches so far...")
     
     print(f"  Matched {border_matches} border region instance pairs")
+    print(f"  Performance: {total_bbox_checks} bbox checks, {total_centroid_checks} centroid checks, {total_ff3d_computations} FF3D computations")
     print(f"  ✓ Stage 2.5 completed: Border region matching done")
 
     # =========================================================================
@@ -2004,9 +2313,6 @@ def merge_tiles(
     print("Stage 4: Merging tiles and deduplicating")
     print(f"{'=' * 60}")
 
-    # Ground marker: use -1 to mark ground points (saves memory vs separate bool array)
-    GROUND_MARKER = -1
-
     all_points = []
     all_instances = []
     all_species = []
@@ -2020,7 +2326,7 @@ def merge_tiles(
         max_local_inst = tile.instances.max() + 1
 
         # Create lookup tables: local_inst -> merged_id, local_inst -> species, local_inst -> species_prob
-        # Default is 0 (filtered), ground will be marked separately
+        # Default is 0 (filtered), ground points remain as 0
         inst_to_merged = np.zeros(max_local_inst, dtype=np.int32)
         inst_to_species = np.zeros(max_local_inst, dtype=np.int32)
         inst_to_species_prob = np.zeros(max_local_inst, dtype=np.float32)
@@ -2041,10 +2347,7 @@ def merge_tiles(
         remapped_species = inst_to_species[safe_instances]
         remapped_species_prob = inst_to_species_prob[safe_instances]
 
-        # Mark ground points with GROUND_MARKER (-1) instead of 0
-        # This distinguishes them from filtered instances (which also map to 0)
-        ground_mask = tile.instances <= 0
-        remapped_instances[ground_mask] = GROUND_MARKER
+        # Ground points (instance_id <= 0) remain as 0
 
         all_points.append(tile.points)
         all_instances.append(remapped_instances)
@@ -2071,11 +2374,11 @@ def merge_tiles(
     del all_species_prob
     gc.collect()
 
-    # Remove points from filtered instances only (instance_id = 0)
-    # Keep: instance_id > 0 (trees) OR instance_id = -1 (ground)
+    # Remove points from filtered instances only (instance_id = 0 for filtered)
+    # Keep: instance_id > 0 (trees) OR instance_id = 0 (ground)
+    # After removing filtered instances, remaining 0s are ground points
     valid_points_mask = merged_instances != 0
     n_before_filter = len(merged_points)
-    n_ground = np.sum(merged_instances == GROUND_MARKER)
     n_filtered_removed = np.sum(merged_instances == 0)
 
     merged_points = merged_points[valid_points_mask]
@@ -2083,14 +2386,13 @@ def merge_tiles(
     merged_species_ids = merged_species_ids[valid_points_mask]
     merged_species_prob = merged_species_prob[valid_points_mask]
 
-    print(f"  Keeping {n_ground:,} ground points (marked as -1)")
     print(f"  Removed {n_filtered_removed:,} points from filtered buffer instances")
     gc.collect()
 
     print(f"  Total points before dedup: {len(merged_points):,}")
 
     # Deduplicate
-    # Note: ground points have instance_id=-1, tree points have positive IDs
+    # Note: ground points have instance_id=0, tree points have positive IDs
     # Dedup prefers higher IDs, so tree points are kept when overlapping ground
     print("\n  Deduplicating...")
     merged_points, merged_instances, merged_species_ids, merged_species_prob = deduplicate_points(
@@ -2098,9 +2400,8 @@ def merge_tiles(
     )
     gc.collect()  # Free memory from deduplication intermediates
 
-    # Convert ground marker (-1) back to 0 for output
-    ground_count_after_dedup = np.sum(merged_instances == GROUND_MARKER)
-    merged_instances[merged_instances == GROUND_MARKER] = 0
+    # Count ground points after deduplication
+    ground_count_after_dedup = np.sum(merged_instances == 0)
 
     print(f"  Total points after dedup: {len(merged_points):,}")
     print(f"  Ground points after dedup: {ground_count_after_dedup:,}")
@@ -2153,9 +2454,11 @@ def merge_tiles(
                 merged_species_prob,
                 final_species_map,
                 final_species_prob_map,
-                max_points_for_check=10000,
+                min_points_for_hull_check=1000,
+                min_points_for_redistribute=500,
                 max_volume_for_merge=max_volume_for_merge,
                 max_search_radius=5.0,
+                num_threads=num_threads,
                 verbose=verbose,
             )
         )
@@ -2173,8 +2476,8 @@ def merge_tiles(
     print("Renumbering instances")
     print(f"{'=' * 60}")
 
-    unique_instances = sorted(set(merged_instances) - {0, -1})
-    old_to_new = {0: 0, -1: -1}
+    unique_instances = sorted(set(merged_instances) - {0})
+    old_to_new = {0: 0}
     new_species_map = {}
 
     for new_id, old_id in enumerate(unique_instances, start=1):
@@ -2231,7 +2534,7 @@ def merge_tiles(
     print(f"  Total instances: {len(unique_instances)}")
 
     # =========================================================================
-    # Create CSV with instance metadata (PredInstance, species_id, species_prob, has_added_clusters)
+    # Create CSV with instance metadata (PredInstance, species_id, has_added_clusters)
     # =========================================================================
     import csv
     
@@ -2257,21 +2560,16 @@ def merge_tiles(
         writer.writerow([
             "PredInstance",
             "species_id",
-            "species_prob",
             "has_added_clusters"
         ])
         
         # Write one row per unique instance ID
         for final_id in sorted(unique_instances):
             has_clusters = final_id in instances_with_clusters
-            # Get old_merged_id for this final_id to look up species_prob
-            old_merged_id = final_to_old.get(final_id)
-            species_prob_value = merged_species_prob.get(old_merged_id, 0.0) if old_merged_id else 0.0
             
             writer.writerow([
                 final_id,
                 new_species_map.get(final_id, 0),
-                species_prob_value,
                 1 if has_clusters else 0
             ])
     

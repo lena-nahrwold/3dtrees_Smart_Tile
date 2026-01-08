@@ -45,6 +45,7 @@ MERGE_PARAMS = {
     'correspondence_tolerance': 0.05, # Max distance for point correspondence (meters) - MUST BE SMALL!
     'max_volume_for_merge': 4.0,      # Max convex hull volume for small instance merging (m³)
     'workers': 4,                     # Number of parallel workers for processing
+    'verbose': True                 # Print detailed merge decisions
 }
 
 

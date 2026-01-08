@@ -221,7 +221,7 @@ def run_merge_task(args, params):
             enable_matching=not args.disable_matching,
             require_overlap=True,
             enable_volume_merge=True,
-            verbose=False,
+            verbose=True,   
         )
         
         print()
