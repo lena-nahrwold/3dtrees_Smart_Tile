@@ -11,7 +11,7 @@ Pipeline:
 3. Cross-tile instance matching
 4. Merge and deduplicate
 5. Small volume merging
-6. Optionally retile to original files
+6. Retile to original files (required)
 
 Usage:
     python main_merge.py --segmented_folder /path/to/segmented_remapped
@@ -46,19 +46,20 @@ except ImportError:
 
 def run_merge(
     segmented_dir: Path,
+    output_tiles_dir: Path,
+    original_tiles_dir: Path,
     output_merged: Optional[Path] = None,
-    output_tiles_dir: Optional[Path] = None,
-    original_tiles_dir: Optional[Path] = None,
     buffer: float = 10.0,
     overlap_threshold: float = 0.3,
     max_centroid_distance: float = 3.0,
     correspondence_tolerance: float = 0.05,
     max_volume_for_merge: float = 4.0,
+    min_cluster_size: int = 300,
     num_threads: int = 4,
     enable_matching: bool = True,
     require_overlap: bool = True,
     enable_volume_merge: bool = True,
-    verbose: bool = False,
+    verbose: bool = True,
 ) -> Path:
     """
     Run the tile merge pipeline.
@@ -90,6 +91,12 @@ def run_merge(
     if not segmented_dir.exists():
         raise ValueError(f"Segmented directory not found: {segmented_dir}")
     
+    if not original_tiles_dir.exists():
+        raise ValueError(f"Original tiles directory not found: {original_tiles_dir}")
+    
+    if not output_tiles_dir.exists():
+        output_tiles_dir.mkdir(parents=True, exist_ok=True)
+    
     # Auto-derive output path if not provided
     if output_merged is None:
         output_merged = segmented_dir.parent / "merged.laz"
@@ -101,6 +108,8 @@ def run_merge(
     if enable_matching:
         print(f"  Overlap threshold: {overlap_threshold}")
         print(f"  Max centroid distance: {max_centroid_distance}m")
+    print(f"Small cluster reassignment: ENABLED")
+    print(f"  Min cluster size: {min_cluster_size} points")
     print(f"Volume merge: {'ENABLED' if enable_volume_merge else 'DISABLED'}")
     if enable_volume_merge:
         print(f"  Max volume: {max_volume_for_merge} m³")
@@ -124,6 +133,7 @@ def run_merge(
         max_centroid_distance=max_centroid_distance,
         correspondence_tolerance=correspondence_tolerance,
         max_volume_for_merge=max_volume_for_merge,
+        min_cluster_size=min_cluster_size,
         num_threads=num_threads,
         enable_matching=enable_matching,
         require_overlap=require_overlap,
@@ -158,15 +168,15 @@ def main():
     parser.add_argument(
         "--output_tiles_dir",
         type=Path,
-        default=None,
-        help="Output directory for retiled files (optional)"
+        required=True,
+        help="Output directory for retiled files (required)"
     )
     
     parser.add_argument(
         "--original_tiles_dir",
         type=Path,
-        default=None,
-        help="Directory with original tile files for retiling (optional)"
+        required=True,
+        help="Directory with original tile files for retiling (required)"
     )
     
     parser.add_argument(
@@ -202,6 +212,13 @@ def main():
         type=float,
         default=MERGE_PARAMS.get('max_volume_for_merge', 4.0),
         help=f"Max volume for small instance merge (default: {MERGE_PARAMS.get('max_volume_for_merge', 4.0)})"
+    )
+    
+    parser.add_argument(
+        "--min_cluster_size",
+        type=int,
+        default=MERGE_PARAMS.get('min_cluster_size', 300),
+        help=f"Minimum cluster size in points for reassignment (default: {MERGE_PARAMS.get('min_cluster_size', 300)})"
     )
     
     parser.add_argument(
@@ -242,14 +259,15 @@ def main():
         output_file = run_merge(
             segmented_dir=args.segmented_folder,
             output_merged=args.output_merged,
-            output_tiles_dir=args.output_tiles_dir,
-            original_tiles_dir=args.original_tiles_dir,
-            buffer=args.buffer,
-            overlap_threshold=args.overlap_threshold,
-            max_centroid_distance=args.max_centroid_distance,
-            correspondence_tolerance=args.correspondence_tolerance,
-            max_volume_for_merge=args.max_volume_for_merge,
-            num_threads=args.workers,
+        output_tiles_dir=args.output_tiles_dir,
+        original_tiles_dir=args.original_tiles_dir,
+        buffer=args.buffer,
+        overlap_threshold=args.overlap_threshold,
+        max_centroid_distance=args.max_centroid_distance,
+        correspondence_tolerance=args.correspondence_tolerance,
+        max_volume_for_merge=args.max_volume_for_merge,
+        min_cluster_size=args.min_cluster_size,
+        num_threads=args.workers,
             enable_matching=not args.disable_matching,
             require_overlap=not args.disable_overlap_check,
             enable_volume_merge=not args.disable_volume_merge,
