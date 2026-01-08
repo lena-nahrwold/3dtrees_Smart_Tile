@@ -130,6 +130,30 @@ def subsample_tile_chunk(args: Tuple[Path, str, float, Path, int, int]) -> Tuple
                     }
                 ]
             }
+        else:
+            # LAS: Use filters.crop as fallback (LAS readers don't support bounds parameter)
+            pipeline = {
+                "pipeline": [
+                    {
+                        "type": reader_type,
+                        "filename": str(input_file)
+                    },
+                    {
+                        "type": "filters.crop",
+                        "bounds": bounds_str
+                    },
+                    {
+                        "type": "filters.voxelcentroidnearestneighbor",
+                        "cell": resolution
+                    },
+                    {
+                        "type": "writers.las",
+                        "filename": str(chunk_file),
+                        "compression": True,
+                        "extra_dims": "all"
+                    }
+                ]
+            }
         
         # Write and execute pipeline
         pipeline_file = output_dir / f"_pipeline_chunk{chunk_idx}.json"
