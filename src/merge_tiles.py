@@ -34,6 +34,10 @@ from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 
+# Force unbuffered output for real-time progress feedback
+# (especially important when running in Docker/containers)
+sys.stdout.reconfigure(line_buffering=True)
+
 
 # =============================================================================
 # Data Classes
@@ -731,6 +735,57 @@ def compute_centroids_vectorized(
     return centroids
 
 
+def get_border_region_mask(
+    points: np.ndarray,
+    boundary: Tuple[float, float, float, float],
+    inner_dist: float,
+    outer_dist: float,
+    neighbors: Dict[str, Optional[str]],
+) -> np.ndarray:
+    """
+    Get mask for points in the donut-shaped border region.
+    
+    Only considers edges that have neighbors (no point checking for edges without neighbors).
+    
+    Args:
+        points: Nx3 array of point coordinates
+        boundary: (min_x, max_x, min_y, max_y) tile bounds
+        inner_dist: Inner distance from edge (buffer zone boundary)
+        outer_dist: Outer distance from edge (end of border region)
+        neighbors: Dict with 'east', 'west', 'north', 'south' -> neighbor name or None
+    
+    Returns:
+        Boolean mask for points in border region
+    """
+    min_x, max_x, min_y, max_y = boundary
+    x, y = points[:, 0], points[:, 1]
+    
+    # Start with no points selected
+    in_border = np.zeros(len(points), dtype=bool)
+    
+    # West border region: inner_dist <= (x - min_x) < outer_dist
+    if neighbors.get("west") is not None:
+        west_mask = (x >= min_x + inner_dist) & (x < min_x + outer_dist)
+        in_border |= west_mask
+    
+    # East border region: inner_dist <= (max_x - x) < outer_dist
+    if neighbors.get("east") is not None:
+        east_mask = (x > max_x - outer_dist) & (x <= max_x - inner_dist)
+        in_border |= east_mask
+    
+    # South border region: inner_dist <= (y - min_y) < outer_dist
+    if neighbors.get("south") is not None:
+        south_mask = (y >= min_y + inner_dist) & (y < min_y + outer_dist)
+        in_border |= south_mask
+    
+    # North border region: inner_dist <= (max_y - y) < outer_dist
+    if neighbors.get("north") is not None:
+        north_mask = (y > max_y - outer_dist) & (y <= max_y - inner_dist)
+        in_border |= north_mask
+    
+    return in_border
+
+
 # =============================================================================
 # Stage 5: Small Cluster Reassignment / Volume Merging
 # =============================================================================
@@ -901,6 +956,12 @@ def merge_small_volume_instances(
     max_search_radius: float = 5.0,
     num_threads: int = 1,
     verbose: bool = True,
+    # Pre-sorted data (optional) - if provided, skip sorting step
+    presorted_points: Optional[np.ndarray] = None,
+    presorted_instances: Optional[np.ndarray] = None,
+    presorted_unique_inst: Optional[np.ndarray] = None,
+    presorted_first_idx: Optional[np.ndarray] = None,
+    presorted_inst_counts: Optional[np.ndarray] = None,
 ) -> Tuple[
     np.ndarray, np.ndarray, Optional[np.ndarray], Dict[int, int], Dict[int, float], int
 ]:
@@ -930,26 +991,72 @@ def merge_small_volume_instances(
         max_search_radius: Max distance to search for target instance (m) (default: 5.0)
         num_threads: Number of workers for parallel hull computation (default: 1)
         verbose: Print detailed decisions (default: True)
+        presorted_points: Pre-sorted points array (optional, to avoid redundant sorting)
+        presorted_instances: Pre-sorted instances array (optional)
+        presorted_unique_inst: Pre-computed unique instances (optional)
+        presorted_first_idx: Pre-computed first indices (optional)
+        presorted_inst_counts: Pre-computed instance counts (optional)
 
     Returns:
         Updated (instances, species_ids, species_prob, instance_species_map, instance_species_prob_map, bbox_skipped_count)
     """
-
-    # Sort points by instance for efficient slicing - O(n log n) once
-    sort_idx = np.argsort(instances)
-    sorted_instances = instances[sort_idx]
-    sorted_points = points[sort_idx]
-
-    # Get unique instances with boundaries
-    unique_inst, first_idx, inst_counts = np.unique(
-        sorted_instances, return_index=True, return_counts=True
+    import sys
+    
+    # Check if pre-sorted data is provided
+    use_presorted = (
+        presorted_points is not None and
+        presorted_instances is not None and
+        presorted_unique_inst is not None and
+        presorted_first_idx is not None and
+        presorted_inst_counts is not None
     )
+    
+    if use_presorted:
+        print(f"  Using pre-sorted data (skipping sort step)...", flush=True)
+        sys.stdout.flush()
+        sorted_points = presorted_points
+        sorted_instances = presorted_instances
+        unique_inst = presorted_unique_inst
+        first_idx = presorted_first_idx
+        inst_counts = presorted_inst_counts
+        print(f"  {len(unique_inst):,} unique instances from pre-sorted data.", flush=True)
+        sys.stdout.flush()
+    else:
+        # OPTIMIZATION: Filter out instance 0 BEFORE sorting
+        # Instance 0 is unlabeled/ground and never processed, but often 50-80% of points
+        total_points = len(instances)
+        print(f"  Total points: {total_points:,}", flush=True)
+        sys.stdout.flush()
+        
+        nonzero_mask = instances > 0
+        nonzero_count = nonzero_mask.sum()
+        zero_count = total_points - nonzero_count
+        
+        print(f"  Filtering out {zero_count:,} unlabeled points (instance 0, {100*zero_count/total_points:.1f}%)...", flush=True)
+        print(f"  Points to process: {nonzero_count:,} ({100*nonzero_count/total_points:.1f}%)", flush=True)
+        sys.stdout.flush()
+        
+        # Extract only non-zero instance points for sorting (much faster than sorting all)
+        instances_to_sort = instances[nonzero_mask]
+        points_to_sort = points[nonzero_mask]
+        
+        # Sort only the non-zero instance points - O(n log n) on much smaller n
+        print(f"  Sorting {len(instances_to_sort):,} points by instance ID...", flush=True)
+        sys.stdout.flush()
+        sort_idx = np.argsort(instances_to_sort)
+        sorted_instances = instances_to_sort[sort_idx]
+        sorted_points = points_to_sort[sort_idx]
+        print(f"  Sorting complete.", flush=True)
+        sys.stdout.flush()
 
-    # Filter to positive instances
-    pos_mask = unique_inst > 0
-    unique_inst = unique_inst[pos_mask]
-    first_idx = first_idx[pos_mask]
-    inst_counts = inst_counts[pos_mask]
+        # Get unique instances with boundaries (already filtered, no need for pos_mask)
+        print(f"  Finding unique instances...", flush=True)
+        sys.stdout.flush()
+        unique_inst, first_idx, inst_counts = np.unique(
+            sorted_instances, return_index=True, return_counts=True
+        )
+        print(f"  Found {len(unique_inst):,} unique instances.", flush=True)
+        sys.stdout.flush()
 
     # Categorize instances and compute volumes using sorted slices
     # Optimization: Only compute convex hull for instances < min_points_for_hull_check (1000 points)
@@ -962,16 +1069,15 @@ def merge_small_volume_instances(
     bbox_skipped_count = 0  # Track instances skipped by bounding box filter
 
     total_instances = len(unique_inst)
-    if verbose:
-        print(f"  Processing {total_instances:,} instances...")
+    print(f"  Categorizing {total_instances:,} instances (checking bbox volumes)...", flush=True)
 
     for idx, (inst_id, start, count) in enumerate(zip(unique_inst, first_idx, inst_counts)):
         count = int(count)
 
-        # Progress print every 1000 instances or every 10%
-        if verbose and (idx % 1000 == 0 or idx == total_instances // 10 or idx == total_instances - 1):
+        # Progress print every 500 instances for better feedback
+        if idx % 500 == 0 or idx == total_instances - 1:
             progress = (idx + 1) * 100.0 / total_instances
-            print(f"    Progress: {idx + 1:,}/{total_instances:,} instances ({progress:.1f}%)...")
+            print(f"    Categorizing: {idx + 1:,}/{total_instances:,} instances ({progress:.1f}%)...", flush=True)
 
         # Skip large instances (>= min_points_for_hull_check) - they're kept (no hull computation)
         if count >= min_points_for_hull_check:
@@ -1019,15 +1125,15 @@ def merge_small_volume_instances(
         hull_candidates.append((inst_id, count, start, end, bbox_volume))
 
     if verbose:
-        print(f"  Categorized instances: {len(large_instances):,} large, {bbox_skipped_count:,} skipped (large bbox), {len(hull_candidates):,} need hull computation")
+        print(f"  Categorized instances: {len(large_instances):,} large, {bbox_skipped_count:,} skipped (large bbox), {len(hull_candidates):,} need hull computation", flush=True)
 
     # Parallel convex hull computation for candidates using --workers (num_threads)
     # Now compute centroids and extract points only for hull candidates
     if len(hull_candidates) > 0:
         if verbose:
-            print(f"  Computing centroids and convex hulls for {len(hull_candidates):,} instances (< {min_points_for_hull_check} points)...")
+            print(f"  Computing centroids and convex hulls for {len(hull_candidates):,} instances (< {min_points_for_hull_check} points)...", flush=True)
             if num_threads > 1:
-                print(f"    Using {num_threads} workers (--workers={num_threads}) for parallel processing...")
+                print(f"    Using {num_threads} workers (--workers={num_threads}) for parallel processing...", flush=True)
         
         # Extract points and compute centroids only for hull candidates
         # This avoids memory overhead for instances filtered by bbox
@@ -1055,11 +1161,11 @@ def merge_small_volume_instances(
                     
                     if verbose:
                         progress = min(100.0, (len(hull_results) * 100.0 / len(hull_candidates)))
-                        print(f"    Hull progress: {len(hull_results):,}/{len(hull_candidates):,} ({progress:.1f}%)...")
+                        print(f"    Hull progress: {len(hull_results):,}/{len(hull_candidates):,} ({progress:.1f}%)...", flush=True)
         else:
             # Sequential computation for small batches or single thread with progress updates
             if verbose and num_threads == 1:
-                print(f"    Using sequential computation (--workers=1 or <10 candidates)...")
+                print(f"    Using sequential computation (--workers=1 or <10 candidates)...", flush=True)
             hull_results = []
             for idx, args in enumerate(hull_args):
                 result = _compute_hull_wrapper(args)
@@ -1067,11 +1173,11 @@ def merge_small_volume_instances(
                 
                 if verbose and (idx % 100 == 0 or idx == len(hull_args) - 1):
                     progress = (idx + 1) * 100.0 / len(hull_candidates)
-                    print(f"    Hull progress: {idx + 1:,}/{len(hull_candidates):,} ({progress:.1f}%)...")
+                    print(f"    Hull progress: {idx + 1:,}/{len(hull_candidates):,} ({progress:.1f}%)...", flush=True)
         
         # Process hull computation results
         if verbose:
-            print(f"  Processing hull results and categorizing instances...")
+            print(f"  Processing hull results and categorizing instances...", flush=True)
             
         for (inst_id, count, start, end, bbox_volume), (volume, hull_success), centroid in zip(hull_candidates, hull_results, hull_centroids):
             if verbose and not hull_success:
@@ -1107,10 +1213,10 @@ def merge_small_volume_instances(
                                                      for inst_id, count, centroid in small_point_count_instances]
     
     if len(all_small_instances) == 0:
-        print(f"  No small instances to merge/redistribute")
+        print(f"  No small instances to merge/redistribute", flush=True)
         if bbox_skipped_count > 0:
             print(
-                f"  Skipped {bbox_skipped_count} instances using bounding box filter (bbox >= {max_volume_for_merge * 4.0:.1f} m³)"
+                f"  Skipped {bbox_skipped_count} instances using bounding box filter (bbox >= {max_volume_for_merge * 4.0:.1f} m³)", flush=True
             )
         return (
             instances,
@@ -1122,10 +1228,10 @@ def merge_small_volume_instances(
         )
 
     if len(large_instances) == 0:
-        print(f"  No large instances to merge into")
+        print(f"  No large instances to merge into", flush=True)
         if bbox_skipped_count > 0:
             print(
-                f"  Skipped {bbox_skipped_count} instances using bounding box filter (bbox >= {max_volume_for_merge * 4.0:.1f} m³)"
+                f"  Skipped {bbox_skipped_count} instances using bounding box filter (bbox >= {max_volume_for_merge * 4.0:.1f} m³)", flush=True
             )
         return (
             instances,
@@ -1137,15 +1243,15 @@ def merge_small_volume_instances(
         )
 
     print(
-        f"  Found {len(small_volume_instances)} small-volume instances (< {max_volume_for_merge} m³) to merge"
+        f"  Found {len(small_volume_instances)} small-volume instances (< {max_volume_for_merge} m³) to merge", flush=True
     )
     if len(small_point_count_instances) > 0:
         print(
-            f"  Found {len(small_point_count_instances)} small point-count instances (< {min_cluster_size} pts, volume >= {max_volume_for_merge} m³) to redistribute"
+            f"  Found {len(small_point_count_instances)} small point-count instances (< {min_cluster_size} pts, volume >= {max_volume_for_merge} m³) to redistribute", flush=True
         )
     if bbox_skipped_count > 0:
         print(
-            f"  Skipped {bbox_skipped_count} instances using bounding box filter (bbox >= {max_volume_for_merge * 4.0:.1f} m³) - saved convex hull computation"
+            f"  Skipped {bbox_skipped_count} instances using bounding box filter (bbox >= {max_volume_for_merge * 4.0:.1f} m³) - saved convex hull computation", flush=True
         )
 
     # Build KD-tree from large instance centroids (already computed)
@@ -1224,7 +1330,7 @@ def merge_small_volume_instances(
 
     print(
         f"  Merged/redistributed {total_merged:,} points from {len(all_small_instances)} small instances "
-        f"({len(small_volume_instances)} small-volume + {len(small_point_count_instances)} small point-count)"
+        f"({len(small_volume_instances)} small-volume + {len(small_point_count_instances)} small point-count)", flush=True
     )
 
     return (
@@ -1317,69 +1423,21 @@ def load_merged_file(
 # =============================================================================
 
 
-def retile_to_original_files(
-    merged_points: np.ndarray,
-    merged_instances: np.ndarray,
-    merged_species_ids: np.ndarray,
-    original_tiles_dir: Path,
-    output_dir: Path,
-    tolerance: float = 0.1,
-    num_threads: int = 8,
-    chunk_size: int = 1_000_000,
-    all_have_species_id: bool = True,
-):
+def _process_single_tile(args):
     """
-    Map merged instance IDs back to original tile point clouds.
-
-    Uses spatial partitioning for memory efficiency:
-    - For each tile, filter merged points to tile bounds + buffer
-    - Build small KDTree for just that region instead of global tree
-    - Use chunked reading/writing for large tiles
-
-    For each original tile:
-    1. Get tile bounds from header
-    2. Filter merged points to tile region
-    3. Build local KDTree
-    4. Load original points in chunks
-    5. Query and update with instances
-    6. Save updated tile
+    Process a single tile for retiling. Designed to be called in parallel.
+    
+    Args:
+        args: Tuple of (orig_file, output_file, merged_points, merged_instances, 
+              merged_species_ids, tolerance, spatial_buffer, num_threads, all_have_species_id)
+    
+    Returns:
+        Tuple of (filename, matched_count, total_count, unique_instances, success, message)
     """
-    import gc
-
-    print(f"\n{'=' * 60}")
-    print("Retiling merged results to original files (spatial partitioning)")
-    print(f"{'=' * 60}")
-
-    # Find all LAZ files in original directory
-    original_files = sorted(original_tiles_dir.glob("*.laz"))
-    if not original_files:
-        original_files = sorted(original_tiles_dir.glob("*.las"))
-
-    if len(original_files) == 0:
-        print(f"  No LAZ/LAS files found in {original_tiles_dir}")
-        return
-
-    print(f"  Found {len(original_files)} original tile files")
-
-    # Create output directory
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Spatial buffer for filtering merged points (slightly larger than tolerance)
-    spatial_buffer = max(tolerance * 2, 1.0)
-
-    # Process each original tile
-    for orig_file in original_files:
-        output_file = output_dir / orig_file.name
-
-        # Skip if output file already exists
-        if output_file.exists():
-            print(
-                f"\n  Skipping {orig_file.name} (output already exists: {output_file.name})"
-            )
-            continue
-
-        print(f"\n  Processing {orig_file.name}...")
-
+    (orig_file, output_file, merged_points, merged_instances, merged_species_ids,
+     tolerance, spatial_buffer, kdtree_workers, all_have_species_id) = args
+    
+    try:
         # Get tile bounds from header without loading all points
         with laspy.open(
             str(orig_file), laz_backend=laspy.LazBackend.LazrsParallel
@@ -1399,18 +1457,13 @@ def retile_to_original_files(
         local_merged_instances = merged_instances[mask]
         local_merged_species = merged_species_ids[mask]
 
-        print(
-            f"    Filtered {len(local_merged_points):,}/{len(merged_points):,} merged points to tile region"
-        )
-
         if len(local_merged_points) == 0:
-            print(f"    Warning: No merged points in tile region, skipping")
-            continue
+            return (orig_file.name, 0, n_orig_points, 0, False, "No merged points in tile region")
 
         # Build small local KDTree
         local_tree = cKDTree(local_merged_points)
 
-        # Load and process original tile with chunked reading
+        # Load and process original tile
         orig_las = laspy.read(
             str(orig_file), laz_backend=laspy.LazBackend.LazrsParallel
         )
@@ -1419,8 +1472,8 @@ def retile_to_original_files(
         orig_points[:, 1] = orig_las.y
         orig_points[:, 2] = orig_las.z
 
-        # Query local tree - much faster than global tree
-        distances, indices = local_tree.query(orig_points, workers=num_threads)
+        # Query local tree with specified number of KDTree workers
+        distances, indices = local_tree.query(orig_points, workers=kdtree_workers)
 
         # Create new instance and species arrays
         new_instances = np.zeros(n_orig_points, dtype=np.int32)
@@ -1448,28 +1501,382 @@ def retile_to_original_files(
                 )
             orig_las.species_id = new_species
 
-        # Save to output directory (output_file already defined above)
+        # Save to output directory
         orig_las.write(
             str(output_file),
             do_compress=True,
             laz_backend=laspy.LazBackend.LazrsParallel,
         )
 
-        matched = np.sum(valid_mask)
+        matched = int(np.sum(valid_mask))
         unique_inst = len(np.unique(new_instances[new_instances > 0]))
-        print(
-            f"    {matched:,}/{n_orig_points:,} points matched, {unique_inst} instances → {output_file.name}"
+        
+        return (orig_file.name, matched, n_orig_points, unique_inst, True, "OK")
+    
+    except Exception as e:
+        return (orig_file.name, 0, 0, 0, False, str(e))
+
+
+def retile_to_original_files(
+    merged_points: np.ndarray,
+    merged_instances: np.ndarray,
+    merged_species_ids: np.ndarray,
+    original_tiles_dir: Path,
+    output_dir: Path,
+    tolerance: float = 0.1,
+    num_threads: int = 8,
+    chunk_size: int = 1_000_000,
+    all_have_species_id: bool = True,
+    parallel_tiles: int = 1,
+):
+    """
+    Map merged instance IDs back to original tile point clouds.
+
+    Uses spatial partitioning for memory efficiency:
+    - For each tile, filter merged points to tile bounds + buffer
+    - Build small KDTree for just that region instead of global tree
+    - Use chunked reading/writing for large tiles
+
+    For each original tile:
+    1. Get tile bounds from header
+    2. Filter merged points to tile region
+    3. Build local KDTree
+    4. Load original points in chunks
+    5. Query and update with instances
+    6. Save updated tile
+    
+    Args:
+        merged_points: Merged point cloud coordinates
+        merged_instances: Merged instance IDs
+        merged_species_ids: Merged species IDs
+        original_tiles_dir: Directory containing original tile files
+        output_dir: Directory to write output files
+        tolerance: Distance tolerance for point matching
+        num_threads: Number of threads for KDTree queries (per tile)
+        chunk_size: Chunk size for reading large files
+        all_have_species_id: Whether to include species_id in output
+        parallel_tiles: Number of tiles to process in parallel (default: 1 = sequential)
+    """
+    import gc
+    from concurrent.futures import ThreadPoolExecutor
+    import sys
+
+    print(f"\n{'=' * 60}", flush=True)
+    print("Retiling merged results to original files (spatial partitioning)", flush=True)
+    print(f"{'=' * 60}", flush=True)
+    sys.stdout.flush()
+
+    # Find all LAZ files in original directory
+    original_files = sorted(original_tiles_dir.glob("*.laz"))
+    if not original_files:
+        original_files = sorted(original_tiles_dir.glob("*.las"))
+
+    if len(original_files) == 0:
+        print(f"  No LAZ/LAS files found in {original_tiles_dir}", flush=True)
+        return
+
+    print(f"  Found {len(original_files)} original tile files", flush=True)
+    print(f"  Parallel tiles: {parallel_tiles}, KDTree workers per tile: {num_threads}", flush=True)
+    sys.stdout.flush()
+
+    # Create output directory
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Spatial buffer for filtering merged points (slightly larger than tolerance)
+    spatial_buffer = max(tolerance * 2, 1.0)
+
+    # Filter out already-processed files
+    tiles_to_process = []
+    for orig_file in original_files:
+        output_file = output_dir / orig_file.name
+        if output_file.exists():
+            print(f"  Skipping {orig_file.name} (output already exists)", flush=True)
+        else:
+            tiles_to_process.append((orig_file, output_file))
+    
+    if len(tiles_to_process) == 0:
+        print(f"  All tiles already processed!", flush=True)
+        return
+    
+    print(f"  Processing {len(tiles_to_process)} tiles...", flush=True)
+    sys.stdout.flush()
+
+    # Prepare arguments for parallel processing
+    # Use -1 for KDTree workers = use all available CPUs
+    kdtree_workers = -1
+    print(f"  KDTree workers: {kdtree_workers} (all available CPUs)", flush=True)
+    
+    process_args = [
+        (orig_file, output_file, merged_points, merged_instances, merged_species_ids,
+         tolerance, spatial_buffer, kdtree_workers, all_have_species_id)
+        for orig_file, output_file in tiles_to_process
+    ]
+
+    # Process tiles (parallel or sequential)
+    if parallel_tiles > 1:
+        print(f"\n  Starting parallel processing ({parallel_tiles} tiles at a time)...", flush=True)
+        sys.stdout.flush()
+        
+        completed = 0
+        with ThreadPoolExecutor(max_workers=parallel_tiles) as executor:
+            for result in executor.map(_process_single_tile, process_args):
+                filename, matched, total, unique_inst, success, message = result
+                completed += 1
+                
+                if success:
+                    print(f"  [{completed}/{len(tiles_to_process)}] {filename}: {matched:,}/{total:,} matched, {unique_inst} instances", flush=True)
+                else:
+                    print(f"  [{completed}/{len(tiles_to_process)}] {filename}: FAILED - {message}", flush=True)
+                sys.stdout.flush()
+    else:
+        # Sequential processing with detailed output
+        for i, args in enumerate(process_args):
+            orig_file = args[0]
+            print(f"\n  [{i+1}/{len(tiles_to_process)}] Processing {orig_file.name}...", flush=True)
+            sys.stdout.flush()
+            
+            result = _process_single_tile(args)
+            filename, matched, total, unique_inst, success, message = result
+            
+            if success:
+                print(f"    {matched:,}/{total:,} points matched, {unique_inst} instances → {filename}", flush=True)
+            else:
+                print(f"    FAILED: {message}", flush=True)
+            sys.stdout.flush()
+            
+            # Clean up after each tile in sequential mode
+            gc.collect()
+
+    print(f"\n  Retiling complete: {len(tiles_to_process)} tiles processed", flush=True)
+    gc.collect()
+
+
+# =============================================================================
+# Stage 7: Remap to Original Input Files
+# =============================================================================
+
+
+def _process_single_original_input_file(args):
+    """
+    Process a single original input LAZ file for remapping. Designed to be called in parallel.
+    
+    Args:
+        args: Tuple of (input_file, output_file, merged_points, merged_instances, 
+              merged_species_ids, tolerance, spatial_buffer, kdtree_workers, all_have_species_id)
+    
+    Returns:
+        Tuple of (filename, matched_count, total_count, unique_instances, success, message)
+    """
+    (input_file, output_file, merged_points, merged_instances, merged_species_ids,
+     tolerance, spatial_buffer, kdtree_workers, all_have_species_id) = args
+    
+    try:
+        # Get file bounds from header without loading all points
+        with laspy.open(
+            str(input_file), laz_backend=laspy.LazBackend.LazrsParallel
+        ) as f:
+            bounds = (f.header.x_min, f.header.x_max, f.header.y_min, f.header.y_max)
+            n_input_points = f.header.point_count
+
+        # Filter merged points to this file's region + buffer
+        mask = (
+            (merged_points[:, 0] >= bounds[0] - spatial_buffer)
+            & (merged_points[:, 0] <= bounds[1] + spatial_buffer)
+            & (merged_points[:, 1] >= bounds[2] - spatial_buffer)
+            & (merged_points[:, 1] <= bounds[3] + spatial_buffer)
         )
 
-        # Clean up local variables to free memory
-        del (
-            local_tree,
-            local_merged_points,
-            local_merged_instances,
-            local_merged_species,
+        local_merged_points = merged_points[mask]
+        local_merged_instances = merged_instances[mask]
+        local_merged_species = merged_species_ids[mask]
+
+        if len(local_merged_points) == 0:
+            return (input_file.name, 0, n_input_points, 0, False, "No merged points in file region")
+
+        # Build small local KDTree from merged points
+        local_tree = cKDTree(local_merged_points)
+
+        # Load original input file
+        input_las = laspy.read(
+            str(input_file), laz_backend=laspy.LazBackend.LazrsParallel
         )
-        del orig_las, orig_points, distances, indices, new_instances, new_species
+        input_points = np.empty((n_input_points, 3), dtype=np.float64)
+        input_points[:, 0] = input_las.x
+        input_points[:, 1] = input_las.y
+        input_points[:, 2] = input_las.z
+
+        # Query local tree with specified number of KDTree workers
+        distances, indices = local_tree.query(input_points, workers=kdtree_workers)
+
+        # Create new instance and species arrays
+        new_instances = np.zeros(n_input_points, dtype=np.int32)
+        new_species = np.zeros(n_input_points, dtype=np.int32)
+
+        # Copy from merged where distance is within tolerance
+        valid_mask = distances < tolerance
+        matched_count = np.sum(valid_mask)
+        new_instances[valid_mask] = local_merged_instances[indices[valid_mask]]
+        new_species[valid_mask] = local_merged_species[indices[valid_mask]]
+
+        # Count unique non-zero instances
+        unique_instances = len(np.unique(new_instances[new_instances > 0]))
+
+        # Add/update extra dimensions
+        extra_dims = {dim.name for dim in input_las.point_format.extra_dimensions}
+
+        if "PredInstance" not in extra_dims:
+            input_las.add_extra_dim(
+                laspy.ExtraBytesParams(name="PredInstance", type=np.int32)
+            )
+        input_las.PredInstance = new_instances
+
+        # Only add species_id if it was present in all input files
+        if all_have_species_id:
+            if "species_id" not in extra_dims:
+                input_las.add_extra_dim(
+                    laspy.ExtraBytesParams(name="species_id", type=np.int32)
+                )
+            input_las.species_id = new_species
+
+        # Save to output directory
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        input_las.write(
+            str(output_file),
+            do_compress=True,
+            laz_backend=laspy.LazBackend.LazrsParallel,
+        )
+
+        return (input_file.name, matched_count, n_input_points, unique_instances, True, "Success")
+
+    except Exception as e:
+        return (input_file.name, 0, 0, 0, False, str(e))
+
+
+def remap_to_original_input_files(
+    merged_points: np.ndarray,
+    merged_instances: np.ndarray,
+    merged_species_ids: np.ndarray,
+    original_input_dir: Path,
+    output_dir: Path,
+    tolerance: float = 0.1,
+    num_threads: int = 8,
+    all_have_species_id: bool = True,
+):
+    """
+    Map merged instance IDs back to original input LAZ files (pre-tiling).
+    
+    This is the final stage of the pipeline that transfers PredInstance labels
+    from the merged/processed point cloud back to the original input files,
+    ensuring ALL original points have the new dimension.
+
+    Uses cKDTree for efficient nearest-neighbor lookup:
+    - For each original input file, filter merged points to file bounds + buffer
+    - Build local cKDTree from filtered merged points
+    - Query nearest neighbor for all original points
+    - Add PredInstance dimension with queried values
+    - Points with distance > tolerance get PredInstance=0 (unmatched)
+
+    Args:
+        merged_points: Merged point cloud coordinates (N, 3)
+        merged_instances: Merged instance IDs (N,)
+        merged_species_ids: Merged species IDs (N,)
+        original_input_dir: Directory containing original input LAZ files (pre-tiling)
+        output_dir: Directory to write output files with PredInstance
+        tolerance: Distance tolerance for point matching (default: 0.1m)
+        num_threads: Number of threads for KDTree queries (default: 8)
+        all_have_species_id: Whether to include species_id in output
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    
+    print(f"\n{'=' * 60}", flush=True)
+    print("Stage 7: Remapping to Original Input Files", flush=True)
+    print(f"{'=' * 60}", flush=True)
+    sys.stdout.flush()
+
+    # Find all LAZ files in original input directory
+    original_files = sorted(original_input_dir.glob("*.laz"))
+    if not original_files:
+        original_files = sorted(original_input_dir.glob("*.las"))
+
+    if len(original_files) == 0:
+        print(f"  No LAZ/LAS files found in {original_input_dir}", flush=True)
+        return
+    
+    # Skip COPC files (these are intermediate, not original inputs)
+    original_files = [f for f in original_files if not f.name.endswith('.copc.laz')]
+    
+    if len(original_files) == 0:
+        print(f"  No original input files found (only COPC files present)", flush=True)
+        return
+
+    print(f"  Found {len(original_files)} original input files", flush=True)
+    print(f"  Output directory: {output_dir}", flush=True)
+    print(f"  Tolerance: {tolerance}m", flush=True)
+    sys.stdout.flush()
+
+    # Create output directory
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Spatial buffer for filtering merged points (slightly larger than tolerance)
+    spatial_buffer = max(tolerance * 2, 1.0)
+
+    # Filter out already-processed files
+    files_to_process = []
+    for input_file in original_files:
+        output_file = output_dir / input_file.name
+        if output_file.exists():
+            print(f"  Skipping {input_file.name} (output already exists)", flush=True)
+        else:
+            files_to_process.append((input_file, output_file))
+    
+    if len(files_to_process) == 0:
+        print(f"  All files already processed!", flush=True)
+        return
+    
+    print(f"  Processing {len(files_to_process)} files...", flush=True)
+    sys.stdout.flush()
+
+    # Use -1 for KDTree workers = use all available CPUs
+    kdtree_workers = -1
+    
+    process_args = [
+        (input_file, output_file, merged_points, merged_instances, merged_species_ids,
+         tolerance, spatial_buffer, kdtree_workers, all_have_species_id)
+        for input_file, output_file in files_to_process
+    ]
+
+    # Process files sequentially for stability with large files
+    total_matched = 0
+    total_points = 0
+    
+    for i, args in enumerate(process_args):
+        input_file = args[0]
+        print(f"\n  [{i+1}/{len(files_to_process)}] Processing {input_file.name}...", flush=True)
+        sys.stdout.flush()
+        
+        result = _process_single_original_input_file(args)
+        filename, matched, total, unique_inst, success, message = result
+        
+        if success:
+            match_pct = (matched / total * 100) if total > 0 else 0
+            print(f"    {matched:,}/{total:,} points matched ({match_pct:.1f}%), {unique_inst} instances", flush=True)
+            total_matched += matched
+            total_points += total
+        else:
+            print(f"    FAILED: {message}", flush=True)
+        sys.stdout.flush()
+        
+        # Clean up after each file
         gc.collect()
+
+    # Summary
+    overall_match_pct = (total_matched / total_points * 100) if total_points > 0 else 0
+    print(f"\n  Remap to original files complete:", flush=True)
+    print(f"    Files processed: {len(files_to_process)}", flush=True)
+    print(f"    Total points: {total_points:,}", flush=True)
+    print(f"    Total matched: {total_matched:,} ({overall_match_pct:.1f}%)", flush=True)
+    print(f"    Output: {output_dir}", flush=True)
+    gc.collect()
 
 
 # =============================================================================
@@ -1482,6 +1889,7 @@ def merge_tiles(
     original_tiles_dir: Path,
     output_merged: Path,
     output_tiles_dir: Path,
+    original_input_dir: Optional[Path] = None,
     buffer: float = 10.0,
     overlap_threshold: float = 0.3,
     max_centroid_distance: float = 3.0,
@@ -1659,6 +2067,7 @@ def merge_tiles(
     instance_sizes = {}  # global_id -> point count
 
     for tile_idx, tile in enumerate(tiles):
+        print(f"  Processing tile {tile_idx + 1}/{len(tiles)}: {tile.name} ({len(tile.points):,} points)...")
         kept_instances = kept_instances_per_tile[tile.name]
 
         # Single pass: sort by instance for efficient grouping
@@ -1803,67 +2212,71 @@ def merge_tiles(
         
         border_instances[tile_name] = {}
         
-        # OPTIMIZATION: Use vectorized centroid computation instead of per-instance loops
-        # This is O(n log n) instead of O(k * n) where k = number of instances
-        print(f"      Computing centroids for all instances (vectorized)...")
-        all_centroids = compute_centroids_vectorized(tile.points, tile.instances)
+        # OPTIMIZATION: Filter points to donut-shaped border region FIRST
+        # This dramatically reduces the number of centroids we need to compute
+        print(f"      Filtering points to border region (donut)...")
+        border_mask = get_border_region_mask(
+            tile.points, tile.boundary, actual_buffer, border_zone_end, neighbors
+        )
+        border_points = tile.points[border_mask]
+        border_inst_ids = tile.instances[border_mask]
+        n_border_points = np.sum(border_mask)
+        print(f"      Border region: {n_border_points:,}/{len(tile.points):,} points ({100*n_border_points/len(tile.points):.1f}%)")
         
-        # Filter to kept instances only
-        kept_ids_array = np.array(sorted(kept_instances), dtype=tile.instances.dtype)
+        # Get unique instances in border region (much smaller set than all instances)
+        border_unique_insts = set(np.unique(border_inst_ids)) - {0}
+        border_unique_insts &= kept_instances  # Only kept instances
         
-        print(f"      Checking {len(kept_ids_array)} kept instances for border region membership...")
+        if len(border_unique_insts) == 0:
+            print(f"      No border region instances in {tile.name}")
+            continue
+        
+        # Compute centroids ONLY for instances in border region
+        print(f"      Computing centroids for {len(border_unique_insts)} border instances (vs {len(kept_instances)} total)...")
+        border_centroids = compute_centroids_vectorized(border_points, border_inst_ids)
+        
         border_count = 0
         
-        # For border region instances, we still need to extract points and compute bboxes
-        # But we can use the pre-computed centroids first to filter candidates
-        for inst_id in kept_ids_array:
-            if inst_id <= 0 or inst_id not in all_centroids:
+        # For each border instance, determine direction and extract full points
+        for inst_id in border_unique_insts:
+            if inst_id not in border_centroids:
                 continue
             
-            # Use pre-computed centroid (fast - O(1) lookup)
-            centroid = all_centroids[inst_id]
+            centroid = border_centroids[inst_id]
             cx, cy = centroid[0], centroid[1]
             
-            # Check if centroid is in border region (between buffer and buffer+10m)
-            in_border_region = False
+            # Determine border direction based on centroid position
             border_direction = None
+            if neighbors["west"] is not None and cx < min_x + border_zone_end:
+                border_direction = "west"
+            elif neighbors["east"] is not None and cx > max_x - border_zone_end:
+                border_direction = "east"
+            elif neighbors["south"] is not None and cy < min_y + border_zone_end:
+                border_direction = "south"
+            elif neighbors["north"] is not None and cy > max_y - border_zone_end:
+                border_direction = "north"
             
-            if neighbors["west"] is not None:
-                if border_inner_min_x <= cx < border_outer_min_x:
-                    in_border_region = True
-                    border_direction = "west"
-            if neighbors["east"] is not None and not in_border_region:
-                if border_outer_max_x < cx <= border_inner_max_x:
-                    in_border_region = True
-                    border_direction = "east"
-            if neighbors["south"] is not None and not in_border_region:
-                if border_inner_min_y <= cy < border_outer_min_y:
-                    in_border_region = True
-                    border_direction = "south"
-            if neighbors["north"] is not None and not in_border_region:
-                if border_outer_max_y < cy <= border_inner_max_y:
-                    in_border_region = True
-                    border_direction = "north"
+            if border_direction is None:
+                continue
             
-            if in_border_region:
-                # Only now extract points and compute bbox (only for border instances)
-                mask = tile.instances == inst_id
-                inst_points = tile.points[mask]
-                
-                # Compute instance bounding box
-                inst_minx = inst_points[:, 0].min()
-                inst_maxx = inst_points[:, 0].max()
-                inst_miny = inst_points[:, 1].min()
-                inst_maxy = inst_points[:, 1].max()
-                
-                border_instances[tile_name][inst_id] = {
-                    'centroid': centroid,
-                    'points': inst_points,
-                    'boundary': (inst_minx, inst_maxx, inst_miny, inst_maxy),
-                    'direction': border_direction,
-                    'tile_idx': tile_idx
-                }
-                border_count += 1
+            # Extract full instance points (from original tile, not just border region)
+            inst_mask = tile.instances == inst_id
+            inst_points = tile.points[inst_mask]
+            
+            # Compute instance bounding box
+            inst_minx = inst_points[:, 0].min()
+            inst_maxx = inst_points[:, 0].max()
+            inst_miny = inst_points[:, 1].min()
+            inst_maxy = inst_points[:, 1].max()
+            
+            border_instances[tile_name][inst_id] = {
+                'centroid': centroid,
+                'points': inst_points,
+                'boundary': (inst_minx, inst_maxx, inst_miny, inst_maxy),
+                'direction': border_direction,
+                'tile_idx': tile_idx
+            }
+            border_count += 1
         
         print(f"      Found {border_count} border region instances in {tile.name}")
     
@@ -2444,30 +2857,87 @@ def merge_tiles(
     # Stage 5: Small Volume Instance Merging
     # =========================================================================
     if enable_volume_merge:
-        print(f"\n{'=' * 60}")
-        print("Stage 5: Small Volume Instance Merging")
-        print(f"{'=' * 60}")
+        import sys
+        print(f"\n{'=' * 60}", flush=True)
+        print("Stage 5: Small Volume Instance Merging", flush=True)
+        print(f"{'=' * 60}", flush=True)
+        sys.stdout.flush()
 
-        # Build species map and species_prob map for final instances
+        # Filter to non-zero instances ONCE (used for both species maps and volume merge)
+        print(f"  Filtering {len(merged_instances):,} points...", flush=True)
+        sys.stdout.flush()
+        pos_mask = merged_instances > 0
+        nonzero_count = pos_mask.sum()
+        zero_count = len(merged_instances) - nonzero_count
+        print(f"  Non-zero: {nonzero_count:,}, Zero/ground: {zero_count:,} ({100*zero_count/len(merged_instances):.1f}%)", flush=True)
+        sys.stdout.flush()
+        
+        # Extract non-zero points/instances for sorting
+        pos_points = merged_points[pos_mask]
+        pos_instances = merged_instances[pos_mask]
+        
+        # Sort ONCE - this sorted data will be reused for both species maps and volume merge
+        print(f"  Sorting {len(pos_instances):,} points by instance (single sort for all operations)...", flush=True)
+        sys.stdout.flush()
+        sort_idx = np.argsort(pos_instances)
+        sorted_points = pos_points[sort_idx]
+        sorted_instances = pos_instances[sort_idx]
+        print(f"  Sort complete.", flush=True)
+        sys.stdout.flush()
+        
+        # Get unique instances with boundaries (used for both species maps and volume merge)
+        unique_inst, first_idx, inst_counts = np.unique(
+            sorted_instances, return_index=True, return_counts=True
+        )
+        print(f"  Found {len(unique_inst):,} unique instances.", flush=True)
+        sys.stdout.flush()
+        
+        # Build species maps only if species data is available
         final_species_map = {}
         final_species_prob_map = {}
-        for inst_id in np.unique(merged_instances):
-            if inst_id > 0:
-                mask = merged_instances == inst_id
-                species = merged_species_ids[mask]
-                if len(species) > 0:
-                    unique, counts = np.unique(species, return_counts=True)
+        
+        if all_have_species_id:
+            print(f"  Building species maps (species data available)...", flush=True)
+            sys.stdout.flush()
+            
+            # Extract and sort species data using the same sort index
+            pos_species = merged_species_ids[pos_mask]
+            sorted_species = pos_species[sort_idx]
+            
+            pos_species_prob = merged_species_prob[pos_mask] if merged_species_prob is not None else None
+            sorted_species_prob = pos_species_prob[sort_idx] if pos_species_prob is not None else None
+            
+            for i, (inst_id, start, count) in enumerate(zip(unique_inst, first_idx, inst_counts)):
+                if i % 1000 == 0:
+                    print(f"    Species progress: {i:,}/{len(unique_inst):,} ({100*i/len(unique_inst):.1f}%)...", flush=True)
+                    sys.stdout.flush()
+                
+                end = start + count
+                species_slice = sorted_species[start:end]
+                
+                if len(species_slice) > 0:
+                    unique, counts = np.unique(species_slice, return_counts=True)
                     final_species_map[inst_id] = unique[np.argmax(counts)]
-                # Get mean species_prob for this instance
-                if merged_species_prob is not None:
-                    species_prob_values = merged_species_prob[mask]
-                    if len(species_prob_values) > 0:
-                        final_species_prob_map[inst_id] = float(np.mean(species_prob_values))
+                
+                if sorted_species_prob is not None:
+                    prob_slice = sorted_species_prob[start:end]
+                    if len(prob_slice) > 0:
+                        final_species_prob_map[inst_id] = float(np.mean(prob_slice))
                     else:
                         final_species_prob_map[inst_id] = 0.0
                 else:
                     final_species_prob_map[inst_id] = 0.0
+            
+            print(f"  Species maps built for {len(unique_inst):,} instances.", flush=True)
+            sys.stdout.flush()
+        else:
+            print(f"  Skipping species map building (no species data in input files).", flush=True)
+            sys.stdout.flush()
 
+        # Call volume merge with pre-sorted data (avoids redundant sort!)
+        print(f"  Starting volume-based instance merging...", flush=True)
+        sys.stdout.flush()
+        
         merged_instances, merged_species_ids, merged_species_prob, final_species_map, final_species_prob_map, _ = (
             merge_small_volume_instances(
                 merged_points,
@@ -2482,14 +2952,20 @@ def merge_tiles(
                 max_search_radius=5.0,
                 num_threads=num_threads,
                 verbose=verbose,
+                # Pass pre-sorted data to avoid sorting again!
+                presorted_points=sorted_points,
+                presorted_instances=sorted_instances,
+                presorted_unique_inst=unique_inst,
+                presorted_first_idx=first_idx,
+                presorted_inst_counts=inst_counts,
             )
         )
-        print(f"  ✓ Stage 5 completed: Small volume instance merging done")
+        print(f"  ✓ Stage 5 completed: Small volume instance merging done", flush=True)
     else:
-        print(f"\n{'=' * 60}")
-        print("Stage 5: Small Volume Instance Merging (DISABLED)")
-        print(f"{'=' * 60}")
-        print(f"  ✓ Stage 5 skipped (disabled)")
+        print(f"\n{'=' * 60}", flush=True)
+        print("Stage 5: Small Volume Instance Merging (DISABLED)", flush=True)
+        print(f"{'=' * 60}", flush=True)
+        print(f"  ✓ Stage 5 skipped (disabled)", flush=True)
 
     # =========================================================================
     # Renumber instances to continuous IDs
@@ -2647,6 +3123,31 @@ def merge_tiles(
     )
     print(f"  ✓ Stage 6 completed: Retiled to original files")
 
+    # =========================================================================
+    # Stage 7: Remap to Original Input Files (if provided)
+    # =========================================================================
+    if original_input_dir is not None:
+        print(f"\n{'=' * 60}")
+        print("Stage 7: Remapping to Original Input Files")
+        print(f"{'=' * 60}")
+        
+        # Output directory for original files with predictions
+        original_output_dir = output_tiles_dir.parent / "original_with_predictions"
+        
+        remap_to_original_input_files(
+            merged_points,
+            merged_instances,
+            merged_species_ids,
+            original_input_dir,
+            original_output_dir,
+            tolerance=0.1,
+            num_threads=num_threads,
+            all_have_species_id=all_have_species_id,
+        )
+        print(f"  ✓ Stage 7 completed: Remapped to original input files")
+    else:
+        print(f"\n  Note: --original-input-dir not provided, skipping Stage 7 (remap to original input files)")
+
     print(f"\n{'=' * 60}")
     print("Merge complete!")
     print(f"{'=' * 60}")
@@ -2691,6 +3192,13 @@ def main():
         type=Path,
         default=None,
         help="Output directory for retiled files",
+    )
+
+    parser.add_argument(
+        "--original-input-dir",
+        type=Path,
+        default=None,
+        help="Directory with original input LAZ files for final remap (optional, enables Stage 7)",
     )
 
     parser.add_argument(
@@ -2776,6 +3284,7 @@ def main():
         original_tiles_dir=args.original_tiles_dir,
         output_merged=args.output_merged,
         output_tiles_dir=args.output_tiles_dir,
+        original_input_dir=args.original_input_dir,
         buffer=args.buffer,
         overlap_threshold=args.overlap_threshold,
         max_centroid_distance=args.max_centroid_distance,

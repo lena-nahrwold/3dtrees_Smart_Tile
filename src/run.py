@@ -7,24 +7,29 @@ Routes to appropriate task modules based on --task parameter:
 - merge: Remap predictions and merge tiles with instance matching
 
 Usage:
-    python run.py --task tile --input_dir /path/to/input --output_dir /path/to/output
-    python run.py --task merge --subsampled_10cm_folder /path/to/subsampled_10cm
+    python src/run.py --task tile --input-dir /path/to/input --output-dir /path/to/output
+    python src/run.py --task merge --subsampled-10cm-folder /path/to/subsampled_10cm --original-input-dir /path/to/input
 """
 
-import argparse
-import os
 import sys
+import argparse
 from pathlib import Path
 
-# Import parameter loading functions
+# Add src directory to path for imports when run from project root
+_src_dir = Path(__file__).parent.resolve()
+if str(_src_dir) not in sys.path:
+    sys.path.insert(0, str(_src_dir))
+
+# Import Pydantic-based parameters
 try:
-    from parameters import load_params, print_params, TILE_PARAMS, REMAP_PARAMS, MERGE_PARAMS
-except ImportError:
-    print("Error: Could not import parameters.py")
+    from parameters import Parameters, print_params, get_tile_params, get_merge_params, get_remap_params
+except ImportError as e:
+    print(f"Error: Could not import parameters.py: {e}")
+    print("Please install required dependencies: pip install pydantic pydantic-settings")
     sys.exit(1)
 
 
-def run_tile_task(args, params):
+def run_tile_task(params: Parameters):
     """
     Run the tile task: XYZ reduction, COPC conversion, tiling, and subsampling.
     
@@ -46,32 +51,31 @@ def run_tile_task(args, params):
         sys.exit(1)
     
     # Required arguments
-    if not args.input_dir:
-        print("Error: --input_dir is required for tile task")
+    if not params.input_dir:
+        print("Error: --input-dir is required for tile task")
         sys.exit(1)
-    if not args.output_dir:
-        print("Error: --output_dir is required for tile task")
+    if not params.output_dir:
+        print("Error: --output-dir is required for tile task")
         sys.exit(1)
     
     # Validate input directory
-    input_dir = Path(args.input_dir)
-    output_dir = Path(args.output_dir)
+    input_dir = Path(params.input_dir)
+    output_dir = Path(params.output_dir)
     
     if not input_dir.exists():
         print(f"Error: Input directory does not exist: {input_dir}")
         sys.exit(1)
     
-    # Get parameters (command-line overrides defaults)
-    tile_length = args.tile_length if args.tile_length else params.get('tile_length', 100)
-    tile_buffer = args.tile_buffer if args.tile_buffer else params.get('tile_buffer', 5)
-    threads = args.threads if args.threads else params.get('threads', 5)
-    workers = args.workers if args.workers else params.get('workers', 4)
-    grid_offset = args.grid_offset if args.grid_offset else params.get('grid_offset', 1.0)
-    skip_dimension_reduction = args.skip_dimension_reduction if hasattr(args, 'skip_dimension_reduction') and args.skip_dimension_reduction else params.get('skip_dimension_reduction', False)
-    # num_spatial_chunks defaults to workers (one chunk per worker)
-    num_spatial_chunks = args.num_spatial_chunks if args.num_spatial_chunks else None  # None means auto = workers
-    res1 = params.get('resolution_1', 0.02)
-    res2 = params.get('resolution_2', 0.1)
+    # Get parameters from Pydantic model
+    tile_length = params.tile_length
+    tile_buffer = params.tile_buffer
+    threads = params.threads
+    workers = params.workers
+    grid_offset = params.grid_offset
+    skip_dimension_reduction = params.skip_dimension_reduction
+    num_spatial_chunks = params.num_spatial_chunks
+    res1 = params.resolution_1
+    res2 = params.resolution_2
     
     print("=" * 60)
     print("Running Tile Task (Python Pipeline)")
@@ -120,18 +124,24 @@ def run_tile_task(args, params):
         print(f"Subsampled {int(res1*100)}cm: {res1_dir}")
         print(f"Subsampled {int(res2*100)}cm: {res2_dir}")
         
+        # Return the input_dir for use in merge task if needed
+        return input_dir
+        
     except Exception as e:
         print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 
-def run_merge_task(args, params):
+def run_merge_task(params: Parameters):
     """
     Run the merge task: remap predictions and merge tiles.
     
     Pipeline:
     1. Remap predictions from 10cm to target resolution (via main_remap.py)
     2. Merge tiles with instance matching (via main_merge.py)
+    3. Remap to original input files (if original_input_dir provided)
     """
     # Import Python modules
     try:
@@ -143,18 +153,19 @@ def run_merge_task(args, params):
         sys.exit(1)
     
     # Required arguments - need either subsampled_10cm_folder or segmented_remapped_folder
-    if not args.subsampled_10cm_folder and not args.segmented_remapped_folder:
-        print("Error: --subsampled_10cm_folder or --segmented_remapped_folder is required for merge task")
+    if not params.subsampled_10cm_folder and not params.segmented_remapped_folder:
+        print("Error: --subsampled-10cm-folder or --segmented-remapped-folder is required for merge task")
         sys.exit(1)
     
-    # Get parameters
-    target_resolution = args.target_resolution if args.target_resolution else params.get('target_resolution_cm', 2)
-    workers = args.workers if args.workers else MERGE_PARAMS.get('workers', 4)
-    buffer = args.buffer if args.buffer is not None else MERGE_PARAMS.get('buffer', 10.0)
-    overlap_threshold = args.overlap_threshold if args.overlap_threshold is not None else MERGE_PARAMS.get('overlap_threshold', 0.3)
-    max_centroid_distance = MERGE_PARAMS.get('max_centroid_distance', 3.0)
-    correspondence_tolerance = MERGE_PARAMS.get('correspondence_tolerance', 0.05)
-    max_volume_for_merge = MERGE_PARAMS.get('max_volume_for_merge', 4.0)
+    # Get parameters from Pydantic model
+    target_resolution = params.target_resolution
+    workers = params.workers
+    buffer = params.buffer
+    overlap_threshold = params.overlap_threshold
+    max_centroid_distance = params.max_centroid_distance
+    correspondence_tolerance = params.correspondence_tolerance
+    max_volume_for_merge = params.max_volume_for_merge
+    min_cluster_size = params.min_cluster_size
     
     print("=" * 60)
     print("Running Merge Task (Python Pipeline)")
@@ -164,8 +175,8 @@ def run_merge_task(args, params):
         # Step 1: Remap predictions (if subsampled_10cm_folder provided)
         segmented_remapped_folder = None
         
-        if args.subsampled_10cm_folder:
-            subsampled_10cm_dir = Path(args.subsampled_10cm_folder)
+        if params.subsampled_10cm_folder:
+            subsampled_10cm_dir = Path(params.subsampled_10cm_folder)
             
             if not subsampled_10cm_dir.exists():
                 print(f"Error: Input directory does not exist: {subsampled_10cm_dir}")
@@ -175,18 +186,34 @@ def run_merge_task(args, params):
             print(f"Target resolution: {target_resolution}cm")
             print()
             
-            # Remap
+            # Derive target folder (2cm) and output folder
+            # The 10cm folder is typically at: tiles_100m/subsampled_10cm
+            # The 2cm folder would be at: tiles_100m/subsampled_2cm
+            parent_dir = subsampled_10cm_dir.parent
+            target_folder = params.subsampled_target_folder
+            if target_folder is None:
+                target_folder = parent_dir / f"subsampled_{target_resolution}cm"
+            
+            output_folder = params.output_folder
+            if output_folder is None:
+                output_folder = parent_dir / "segmented_remapped"
+            
+            if not target_folder.exists():
+                print(f"Error: Target resolution folder does not exist: {target_folder}")
+                print(f"Expected folder for {target_resolution}cm subsampled tiles")
+                sys.exit(1)
+            
+            # Remap - source is 10cm segmented, target is 2cm subsampled
             segmented_remapped_folder = remap_all_tiles(
-                subsampled_10cm_dir=subsampled_10cm_dir,
-                target_resolution_cm=target_resolution,
-                subsampled_target_folder=Path(args.subsampled_target_folder) if args.subsampled_target_folder else None,
-                output_folder=Path(args.output_folder) if args.output_folder else None,
-                num_threads=workers
+                source_folder=subsampled_10cm_dir,
+                target_folder=target_folder,
+                output_folder=output_folder,
+                tolerance=5.0
             )
         
         # Step 2: Merge tiles
-        if args.segmented_remapped_folder:
-            segmented_remapped_folder = Path(args.segmented_remapped_folder)
+        if params.segmented_remapped_folder:
+            segmented_remapped_folder = Path(params.segmented_remapped_folder)
         
         if segmented_remapped_folder is None:
             print("Error: No segmented remapped folder available for merge")
@@ -201,27 +228,40 @@ def run_merge_task(args, params):
         print(f"Buffer: {buffer}m")
         print(f"Overlap threshold: {overlap_threshold}")
         print(f"Workers: {workers}")
+        if params.original_input_dir:
+            print(f"Original input dir: {params.original_input_dir}")
         print()
         
-        output_merged = Path(args.output_merged_laz) if args.output_merged_laz else None
-        output_tiles_dir = Path(args.output_tiles_folder) if args.output_tiles_folder else None
-        original_tiles_dir = Path(args.original_tiles_dir) if args.original_tiles_dir else None
+        output_merged = params.output_merged_laz
+        output_tiles_dir = params.output_tiles_folder
+        original_tiles_dir = params.original_tiles_dir
+        original_input_dir = params.original_input_dir
+        
+        # Auto-derive paths if not provided
+        parent_dir = segmented_remapped_folder.parent
+        if output_tiles_dir is None:
+            output_tiles_dir = parent_dir / "output_tiles"
+        if original_tiles_dir is None:
+            # Try to find the tiles directory (parent of subsampled folders)
+            original_tiles_dir = parent_dir
         
         merged_output = run_merge(
             segmented_dir=segmented_remapped_folder,
-            output_merged=output_merged,
             output_tiles_dir=output_tiles_dir,
             original_tiles_dir=original_tiles_dir,
+            original_input_dir=original_input_dir,
+            output_merged=output_merged,
             buffer=buffer,
             overlap_threshold=overlap_threshold,
             max_centroid_distance=max_centroid_distance,
             correspondence_tolerance=correspondence_tolerance,
             max_volume_for_merge=max_volume_for_merge,
+            min_cluster_size=min_cluster_size,
             num_threads=workers,
-            enable_matching=not args.disable_matching,
+            enable_matching=not params.disable_matching,
             require_overlap=True,
-            enable_volume_merge=True,
-            verbose=True,   
+            enable_volume_merge=not params.disable_volume_merge,
+            verbose=params.verbose,
         )
         
         print()
@@ -237,170 +277,87 @@ def run_merge_task(args, params):
         sys.exit(1)
 
 
+def preprocess_boolean_flags(args_list):
+    """
+    Preprocess CLI args to convert boolean flags to explicit True/False for Pydantic.
+    Pydantic expects --flag True/False, but we want --flag to work like argparse.
+    """
+    boolean_flags = [
+        '--show-params', '--show_params',
+        '--skip-dimension-reduction', '--skip_dimension_reduction',
+        '--disable-matching', '--disable_matching',
+        '--disable-volume-merge', '--disable_volume_merge',
+        '--verbose', '-v'
+    ]
+    
+    processed = []
+    i = 0
+    while i < len(args_list):
+        arg = args_list[i]
+        if arg in boolean_flags:
+            # Check if next arg is already True/False
+            if i + 1 < len(args_list) and args_list[i + 1] in ['True', 'False']:
+                processed.extend([arg, args_list[i + 1]])
+                i += 2
+            else:
+                # Add explicit True for boolean flag
+                processed.extend([arg, 'True'])
+                i += 1
+        else:
+            processed.append(arg)
+            i += 1
+    return processed
+
+
 def main():
-    parser = argparse.ArgumentParser(
-        description="3DTrees Smart Tiling Pipeline Orchestrator",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Tile task: XYZ reduction, COPC conversion, tiling, and subsampling
-  python run.py --task tile --input_dir /path/to/input --output_dir /path/to/output
-  
-  # Tile task with custom parameters
-  python run.py --task tile --input_dir /path/to/input --output_dir /path/to/output \\
-    --tile_length 150 --resolution_1 0.03 --workers 8
-  
-  # Tile task with config file
-  python run.py --task tile --input_dir /path/to/input --output_dir /path/to/output \\
-    --config my_params.py
-  
-  # Tile task with config + parameter overrides
-  python run.py --task tile --input_dir /path/to/input --output_dir /path/to/output \\
-    --config my_params.py --tile_length 200
-  
-  # Merge task: remap + merge (provide 10cm folder to run both)
-  python run.py --task merge --subsampled_10cm_folder /path/to/subsampled_10cm
-  
-  # Merge task with custom parameters
-  python run.py --task merge --subsampled_10cm_folder /path/to/subsampled_10cm \\
-    --buffer 15.0 --overlap_threshold 0.4
-  
-  # Merge task: merge only (provide segmented folder)
-  python run.py --task merge --segmented_remapped_folder /path/to/segmented_remapped
-  
-  # View current parameters
-  python run.py --show-params
-        """
-    )
+    # Handle --show-params flag first using argparse (before Pydantic parsing)
+    # This avoids Pydantic's boolean flag parsing issues
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument('--show-params', '--show_params', action='store_true')
+    pre_args, remaining_args = pre_parser.parse_known_args()
     
-    # Parameter configuration
-    parser.add_argument(
-        "--config",
-        type=Path,
-        help="Custom config file (Python file with TILE_PARAMS, REMAP_PARAMS, MERGE_PARAMS)"
-    )
+    # If --show-params was found, add it back to remaining_args for Pydantic
+    if pre_args.show_params:
+        remaining_args = ['--show-params'] + remaining_args
     
-    parser.add_argument(
-        "--show-params",
-        action="store_true",
-        help="Show current parameter configuration and exit"
-    )
+    # Preprocess boolean flags for Pydantic
+    processed_args = [sys.argv[0]] + preprocess_boolean_flags(remaining_args)
     
-    parser.add_argument(
-        "--task",
-        type=str,
-        choices=["tile", "merge"],
-        help="Task to run: tile (tiling+subsampling) or merge (remap+merge)"
-    )
+    # Temporarily replace sys.argv for Pydantic parsing
+    original_argv = sys.argv
+    sys.argv = processed_args
     
-    # Tile task arguments
-    parser.add_argument("--input_dir", type=str, help="Input directory with LAZ files (required for tile)")
-    parser.add_argument("--output_dir", type=str, help="Output directory (required for tile)")
-    
-    # Tile parameters
-    parser.add_argument("--tile_length", type=float, help="Tile size in meters (default: 100)")
-    parser.add_argument("--tile_buffer", type=float, help="Buffer size in meters (default: 5)")
-    parser.add_argument("--grid_offset", type=float, help="Grid offset in meters (default: 1.0)")
-    parser.add_argument("--threads", type=int, help="Threads per COPC writer (default: 5)")
-    parser.add_argument("--workers", type=int, help="Number of parallel workers (default: 4)")
-    parser.add_argument("--num_spatial_chunks", type=int, help="Number of spatial chunks per tile for subsampling (default: equals workers)")
-    parser.add_argument("--resolution_1", type=float, help="First subsampling resolution in meters (default: 0.02 = 2cm)")
-    parser.add_argument("--resolution_2", type=float, help="Second subsampling resolution in meters (default: 0.1 = 10cm)")
-    parser.add_argument("--skip_dimension_reduction", action="store_true", help="Skip XYZ-only reduction and keep all point dimensions")
-    
-    # Remap task arguments (used in merge task)
-    parser.add_argument("--subsampled_10cm_folder", type=str, help="Path to subsampled_10cm folder with segmented results")
-    parser.add_argument("--target_resolution", type=int, help="Target resolution in cm (default: 2)")
-    parser.add_argument("--subsampled_target_folder", type=str, help="Path to target resolution subsampled folder (auto-derived if not specified)")
-    parser.add_argument("--output_folder", type=str, help="Output folder for remapped files (auto-derived if not specified)")
-    
-    # Merge task arguments
-    parser.add_argument("--segmented_remapped_folder", type=str, help="Path to segmented_remapped folder")
-    parser.add_argument("--output_merged_laz", type=str, help="Output path for merged LAZ file (optional)")
-    parser.add_argument("--output_tiles_folder", type=str, help="Output folder for per-tile results (optional)")
-    parser.add_argument("--original_tiles_dir", type=str, help="Directory with original tile files for retiling (optional)")
-    
-    # Merge parameters
-    parser.add_argument("--buffer", type=float, help="Buffer distance for filtering in meters (default: 10.0)")
-    parser.add_argument("--overlap_threshold", type=float, help="Overlap ratio threshold for instance matching (default: 0.3)")
-    parser.add_argument("--max_centroid_distance", type=float, help="Max centroid distance to merge instances (default: 3.0)")
-    parser.add_argument("--correspondence_tolerance", type=float, help="Point correspondence tolerance in meters (default: 0.05)")
-    parser.add_argument("--max_volume_for_merge", type=float, help="Max volume for small instance merge in m³ (default: 4.0)")
-    parser.add_argument("--disable_matching", action="store_true", help="Disable cross-tile instance matching")
-    
-    args = parser.parse_args()
-    
-    # Build parameter overrides from CLI arguments
-    param_overrides = []
-    
-    # Tile parameters
-    if args.tile_length is not None:
-        param_overrides.append(f"tile_length={args.tile_length}")
-    if args.tile_buffer is not None:
-        param_overrides.append(f"tile_buffer={args.tile_buffer}")
-    if args.grid_offset is not None:
-        param_overrides.append(f"grid_offset={args.grid_offset}")
-    if args.threads is not None:
-        param_overrides.append(f"threads={args.threads}")
-    if args.workers is not None:
-        param_overrides.append(f"workers={args.workers}")
-    if args.resolution_1 is not None:
-        param_overrides.append(f"resolution_1={args.resolution_1}")
-    if args.resolution_2 is not None:
-        param_overrides.append(f"resolution_2={args.resolution_2}")
-    if args.skip_dimension_reduction:
-        param_overrides.append(f"skip_dimension_reduction=True")
-    
-    # Remap parameters
-    if args.target_resolution is not None:
-        param_overrides.append(f"target_resolution_cm={args.target_resolution}")
-    
-    # Merge parameters
-    if args.buffer is not None:
-        param_overrides.append(f"buffer={args.buffer}")
-    if args.overlap_threshold is not None:
-        param_overrides.append(f"overlap_threshold={args.overlap_threshold}")
-    if args.max_centroid_distance is not None:
-        param_overrides.append(f"max_centroid_distance={args.max_centroid_distance}")
-    if args.correspondence_tolerance is not None:
-        param_overrides.append(f"correspondence_tolerance={args.correspondence_tolerance}")
-    if args.max_volume_for_merge is not None:
-        param_overrides.append(f"max_volume_for_merge={args.max_volume_for_merge}")
-    
-    # Load parameters with overrides
-    params = load_params(
-        config_file=args.config,
-        param_overrides=param_overrides if param_overrides else None,
-        use_env=True
-    )
-    
-    # Extract specific parameter sets
-    TILE_PARAMS = params['TILE_PARAMS']
-    REMAP_PARAMS = params['REMAP_PARAMS']
-    MERGE_PARAMS = params['MERGE_PARAMS']
+    # Parse parameters using Pydantic (handles CLI automatically)
+    try:
+        params = Parameters()
+    except Exception as e:
+        print(f"Error parsing parameters: {e}")
+        sys.exit(1)
+    finally:
+        # Restore original argv
+        sys.argv = original_argv
     
     # Show parameters if requested
-    if args.show_params:
+    if params.show_params:
         print_params(params)
         sys.exit(0)
     
     # Task is required if not showing params
-    if not args.task:
-        parser.error("--task is required (unless using --show-params)")
-    
-    # Show parameter summary if config or CLI overrides were provided
-    if args.config or param_overrides:
-        print()
-        print_params(params)
-        print()
+    if not params.task:
+        print("Error: --task is required (unless using --show-params)")
+        print("Usage: python run.py --task tile --input-dir /path/to/input --output-dir /path/to/output")
+        print("       python run.py --task merge --subsampled-10cm-folder /path/to/10cm")
+        print("       python run.py --show-params")
+        sys.exit(1)
     
     # Route to appropriate task function
-    if args.task == "tile":
-        run_tile_task(args, TILE_PARAMS)
-    elif args.task == "merge":
-        run_merge_task(args, MERGE_PARAMS)
+    if params.task == "tile":
+        run_tile_task(params)
+    elif params.task == "merge":
+        run_merge_task(params)
     else:
-        print(f"Error: Unknown task: {args.task}")
+        print(f"Error: Unknown task: {params.task}")
+        print("Valid tasks: tile, merge")
         sys.exit(1)
 
 

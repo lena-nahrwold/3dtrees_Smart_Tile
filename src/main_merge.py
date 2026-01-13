@@ -48,6 +48,7 @@ def run_merge(
     segmented_dir: Path,
     output_tiles_dir: Path,
     original_tiles_dir: Path,
+    original_input_dir: Optional[Path] = None,
     output_merged: Optional[Path] = None,
     buffer: float = 10.0,
     overlap_threshold: float = 0.3,
@@ -67,9 +68,10 @@ def run_merge(
     
     Args:
         segmented_dir: Directory containing segmented LAZ tiles
+        output_tiles_dir: Output directory for retiled files
+        original_tiles_dir: Directory with original tile files for retiling
+        original_input_dir: Directory with original input LAZ files for final remap (optional)
         output_merged: Output path for merged LAZ file (auto-derived if None)
-        output_tiles_dir: Output directory for retiled files (optional)
-        original_tiles_dir: Directory with original tile files for retiling (optional)
         buffer: Buffer zone distance in meters
         overlap_threshold: Overlap ratio threshold for instance matching
         max_centroid_distance: Max distance between centroids to merge instances
@@ -116,6 +118,8 @@ def run_merge(
     if enable_volume_merge:
         print(f"  Max volume: {max_volume_for_merge} m³")
     print(f"Workers: {num_threads}")
+    if original_input_dir:
+        print(f"Original input dir: {original_input_dir} (Stage 7 enabled)")
     print()
     
     # Check if core merge function is available
@@ -130,6 +134,7 @@ def run_merge(
         original_tiles_dir=original_tiles_dir,
         output_merged=output_merged,
         output_tiles_dir=output_tiles_dir,
+        original_input_dir=original_input_dir,
         buffer=buffer,
         overlap_threshold=overlap_threshold,
         max_centroid_distance=max_centroid_distance,
@@ -180,6 +185,13 @@ def main():
         type=Path,
         required=True,
         help="Directory with original tile files for retiling (required)"
+    )
+    
+    parser.add_argument(
+        "--original_input_dir",
+        type=Path,
+        default=None,
+        help="Directory with original input LAZ files for final remap (optional, enables Stage 7)"
     )
     
     parser.add_argument(
@@ -267,9 +279,10 @@ def main():
     try:
         output_file = run_merge(
             segmented_dir=args.segmented_folder,
-            output_merged=args.output_merged,
             output_tiles_dir=args.output_tiles_dir,
             original_tiles_dir=args.original_tiles_dir,
+            original_input_dir=args.original_input_dir,
+            output_merged=args.output_merged,
             buffer=args.buffer,
             overlap_threshold=args.overlap_threshold,
             max_centroid_distance=args.max_centroid_distance,
