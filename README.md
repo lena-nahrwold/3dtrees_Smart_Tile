@@ -440,8 +440,8 @@ python src/run.py --task tile --input-dir /data/in --output-dir /data/out --skip
 |-----------|---------|-------------|
 | `--tile-length` | 100 | Tile size in meters |
 | `--tile-buffer` | 5 | Buffer overlap in meters |
-| `--threads` | 5 | Threads per COPC writer |
-| `--workers` | 4 | Number of parallel workers |
+| `--threads` | 5 | Spatial chunks per file during subsampling |
+| `--workers` | 4 | Parallel file/tile processing |
 | `--resolution-1` | 0.02 | First subsampling resolution (2cm) |
 | `--resolution-2` | 0.1 | Second subsampling resolution (10cm) |
 | `--grid-offset` | 1.0 | Grid offset from min coordinates |
@@ -458,6 +458,39 @@ python src/run.py --task tile --input-dir /data/in --output-dir /data/out --skip
 | `--correspondence-tolerance` | 0.05 | Point correspondence tolerance (meters) |
 | `--max-volume-for-merge` | 4.0 | Max volume for small instance merge (m³) |
 | `--original-input-dir` | None | Directory with original input LAZ files for final remap |
+| `--workers` | 4 | Parallel processing (tile loading, KDTree queries) |
+
+### Understanding `--workers` vs `--threads`
+
+These two parameters control different aspects of parallelism:
+
+#### `--workers` (Global Parallelism)
+
+Controls how many files/tasks run simultaneously using Python's `ProcessPoolExecutor`:
+
+| Task | What `--workers` Controls |
+|------|---------------------------|
+| **Tile Task** | Parallel COPC conversions, parallel tile creation |
+| **Merge Task** | Parallel tile loading, parallel convex hull computation, KDTree queries (`workers=-1` uses all CPUs) |
+
+**Memory impact**: Higher values = more files in memory simultaneously
+
+#### `--threads` (Per-File Chunking)
+
+Controls spatial chunking during **subsampling only**:
+
+- Each tile is split into `--threads` spatial chunks along the X-axis
+- Chunks are processed in parallel using `ProcessPoolExecutor`
+- Files are processed **sequentially** (one at a time), but each file's chunks run in parallel
+
+```
+Example with --threads=5:
+  tile.laz → [chunk_0, chunk_1, chunk_2, chunk_3, chunk_4] → parallel subsample → merge
+```
+
+**Memory impact**: Higher values = smaller chunks = less memory per chunk
+
+
 
 ---
 
