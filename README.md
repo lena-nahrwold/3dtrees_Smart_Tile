@@ -151,14 +151,14 @@ This pipeline provides an end-to-end solution with two primary tasks:
 
 | Stage | Component | Description |
 |-------|-----------|-------------|
-| 1 | **Prediction Remapping** | Transfers PredInstance labels from 10cm predictions to 2cm resolution using KDTree nearest-neighbor lookup. |
-| 2 | **Buffer Filtering** | Removes tree instances whose centroids fall within buffer zones of neighboring tiles. |
-| 3 | **Global ID Assignment** | Creates unique instance IDs across all tiles using tile-specific offsets. |
-| 4 | **Cross-tile Matching** | Identifies matching instances in tile overlaps using overlap ratio and centroid distance. |
-| 5 | **Deduplication** | Removes duplicate points from buffer regions using 5cm tolerance. |
-| 6 | **Small Volume Merge** | Reassigns tree fragments with volume < 4m³ to nearest large instance. |
-| 7 | **Retiling** | Maps final instance IDs back to original tile boundaries for per-tile output. |
-| 8 | **Original Remap** | Maps final instance IDs back to original input LAZ files (pre-tiling). |
+| 0 | **Prediction Remapping** | Transfers PredInstance labels from 10cm predictions to 2cm resolution using KDTree nearest-neighbor lookup. |
+| 1 | **Load and Filter** | Loads tiles, applies centroid-based buffer zone filtering to remove duplicate instances. |
+| 2 | **Global ID Assignment** | Creates unique instance IDs across all tiles using tile-specific offsets. |
+| 3 | **Cross-tile Matching** | Identifies matching instances in tile overlaps using overlap ratio and centroid distance (Union-Find grouping). |
+| 4 | **Merge and Deduplicate** | Merges all tiles, removes duplicate points from buffer regions using 5cm tolerance. |
+| 5 | **Small Volume Merge** | Reassigns tree fragments with volume < 4m³ to nearest large instance. |
+| 6 | **Retiling** | Maps final instance IDs back to original tile boundaries for per-tile output. |
+| 7 | **Original Remap** | Maps final instance IDs back to original input LAZ files (pre-tiling, optional). |
 
 ---
 
@@ -270,6 +270,8 @@ python src/run.py --task merge \
     --overlap-threshold 0.3 \                   # Instance matching threshold (default: 30%)
     --max-centroid-distance 3.0 \               # Max centroid distance (default: 3m)
     --workers 8 \                               # Parallel workers (default: 4)
+    --retile-buffer 1.0 \                       # Spatial buffer for retiling (default: 1m)
+    --retile-max-radius 0.1 \                   # Max distance for retiling match (default: 0.1m)
     --disable-matching                          # Disable cross-tile matching
 ```
 
@@ -348,7 +350,7 @@ python src/run.py --task tile --input-dir /data/in --output-dir /data/out --skip
 - `subsampled_2cm/`: Resolution_1 files
 - `subsampled_10cm/`: Resolution_2 files
 
-### Stage 7: Prediction Remapping
+### Stage 0: Prediction Remapping
 
 **Purpose**: Transfer predictions from low-resolution (10cm) back to high-resolution (2cm).
 
@@ -363,63 +365,104 @@ python src/run.py --task tile --input-dir /data/in --output-dir /data/out --skip
 
 **Output**: `{tile_id}_segmented_remapped.laz`
 
-### Stage 8: Buffer Zone Filtering & Cross-Tile Instance Matching
+### Stage 1: Load and Filter
 
-**Purpose**: Remove duplicate instances in overlapping buffer zones and identify instances that span tile boundaries.
+**Purpose**: Load tiles and remove duplicate instances in overlapping buffer zones using centroid-based filtering.
 
-**Algorithm**: Centroid-based filtering with overlap ratio matching using Union-Find grouping
+**Algorithm**: Centroid-based filtering
 
 **Process**:
-1. Compute instance centroids from full tile points (not just border region)
-2. Identify tiles with neighbors (east, west, north, south)
-3. Define border zones on edges facing neighbors (buffer to buffer+`border_zone_width`)
-4. For instances with centroids in border zones:
+1. Load all tile files with `PredInstance` attribute
+2. For each tile, identify neighbors (east, west, north, south)
+3. Compute instance centroids
+4. Remove instances whose centroids fall within buffer zones facing neighbors
+5. Retain instances for tiles that "own" them (based on centroid position)
+
+### Stage 2: Global ID Assignment
+
+**Purpose**: Create unique instance IDs across all tiles.
+
+**Algorithm**: Tile-specific offsets
+
+**Process**:
+1. Calculate maximum instance ID per tile
+2. Assign sequential offsets to each tile
+3. Remap all instance IDs to global unique IDs
+
+### Stage 3: Border Region Instance Matching
+
+**Purpose**: Identify instances that span tile boundaries and group them.
+
+**Algorithm**: Overlap ratio matching with Union-Find grouping
+
+**Process**:
+1. Define border zones on edges facing neighbors (buffer to buffer+`border_zone_width`)
+2. For instances with centroids in border zones:
    - Match with neighboring tile instances using KDTree overlap ratios
    - Apply centroid proximity check (`max_centroid_distance`)
    - Group matched instances using Union-Find
-5. Remove entire instances whose centroids fall within buffer zones
+3. Remap instance IDs so matched instances share the same ID
 
 **Matching Criteria**:
 1. **Centroid proximity**: Centroids within `max_centroid_distance` (default: 3m)
 2. **Overlap ratio**: Fraction of points that correspond exceeds `overlap_threshold` (default: 30%)
 
-### Stage 9: Deduplication and Final Merge
+### Stage 4: Merge and Deduplicate
 
-**Purpose**: Remove duplicate points from buffer regions and create unified output.
+**Purpose**: Merge all tiles and remove duplicate points from buffer regions.
 
 **Algorithm**: KDTree-based point correspondence
 
 **Process**:
-1. Build KDTree of all points
-2. For each point, check for duplicates within 5cm tolerance
-3. Keep only the "canonical" copy (from lower tile index)
-4. Write unified LAZ with consistent instance IDs
+1. Concatenate all tile points
+2. Build KDTree of all points
+3. For each point, check for duplicates within 5cm tolerance
+4. Keep only the "canonical" copy (from lower tile index)
+5. Write unified LAZ with consistent instance IDs
 
-### Stage 10: Small Volume Merging
+### Stage 5: Small Volume Instance Merging
 
 **Purpose**: Reassign orphaned tree fragments to nearby larger instances.
 
 **Criteria**:
 - Instance convex hull volume < `max_volume_for_merge` (default: 4m³)
-- Nearest large instance within 2m
+- Nearest large instance within search radius
 
 **Species Preservation**: Species ID (if available) is always taken from the larger instance.
 
-### Stage 11: Original File Remapping
+### Stage 6: Retiling to Original Files
 
-**Purpose**: Map final instance IDs back to the original input LAZ files (pre-tiling).
+**Purpose**: Map final instance IDs back to original tile boundaries for per-tile output.
+
+**Algorithm**: cKDTree nearest-neighbor lookup
+
+**Process**:
+1. For each original tile file:
+   - Filter merged points spatially to tile bounds + buffer
+   - Build cKDTree from filtered merged points
+   - Query nearest neighbor for all original tile points
+   - Add PredInstance dimension with queried values
+2. Save updated tile files
+
+### Stage 7: Original File Remapping (Optional)
+
+**Purpose**: Map final instance IDs back to the original input LAZ files (pre-tiling). Only runs if `--original-input-dir` is provided.
 
 **Algorithm**: cKDTree nearest-neighbor lookup
 
 **Process**:
 1. For each original input LAZ file:
    - Load all points from the file
-   - Filter merged points spatially to file bounds + buffer
+   - Filter merged points spatially to file bounds + `retile-buffer`
    - Build cKDTree from filtered merged points
    - Query nearest neighbor for all original points
    - Add PredInstance dimension with queried values
-   - Handle unmatched points (distance > tolerance) by setting PredInstance=0
+   - Handle unmatched points (distance > `retile-max-radius`) by setting PredInstance=0
 2. Save updated files with new PredInstance dimension
+
+**Parameters**:
+- `--retile-buffer`: Controls how much to expand the bounding box when filtering merged points (default: 1.0m). Larger values include more merged points in the local KDTree, improving boundary coverage.
+- `--retile-max-radius`: Maximum distance threshold for nearest neighbor matching (default: 0.1m). Should be set based on subsampling resolution (e.g., 0.1m for 2cm voxels).
 
 ---
 
@@ -452,6 +495,8 @@ python src/run.py --task tile --input-dir /data/in --output-dir /data/out --skip
 | `--original-input-dir` | None | Directory with original input LAZ files for final remap |
 | `--skip-merged-file` | False | Skip creating merged LAZ file (only create retiled outputs) |
 | `--workers` | 4 | Parallel processing (tile loading, KDTree queries) |
+| `--retile-buffer` | 1.0 | Spatial buffer expansion for filtering merged points during retiling (meters) |
+| `--retile-max-radius` | 0.1 | Maximum distance for cKDTree nearest neighbor matching during retiling (meters) |
 
 ### Understanding `--workers` vs `--threads`
 
