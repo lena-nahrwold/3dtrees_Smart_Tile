@@ -16,10 +16,11 @@
 8. [Parameters Reference](#parameters-reference)
 9. [Input/Output Formats](#inputoutput-formats)
 10. [Advanced Configuration](#advanced-configuration)
-11. [Troubleshooting](#troubleshooting)
-12. [Project Structure](#project-structure)
-13. [Dependencies](#dependencies)
-14. [License](#license)
+11. [Docker & Automation](#docker--automation)
+12. [Troubleshooting](#troubleshooting)
+13. [Project Structure](#project-structure)
+14. [Dependencies](#dependencies)
+15. [License](#license)
 
 ---
 
@@ -58,13 +59,13 @@ This pipeline provides an end-to-end solution with two primary tasks:
 │                                          ┌───────────────────┐                 │
 │                                          │ Multi-Resolution  │                 │
 │                                          │ Subsampling       │                 │
-│                                          │ (2cm + 10cm)      │                 │
+│                                          │ (1cm + 10cm)      │                 │
 │                                          └───────────────────┘                 │
 │                                                   │                            │
 │                                                   ▼                            │
-│                                           Outputs: tiles_100m/                 │
+│                                           Outputs: tiles_300m/                 │
 │                                                    ├─ c00_r00.copc.laz         │
-│                                                    ├─ subsampled_2cm/          │
+│                                                    ├─ subsampled_1cm/          │
 │                                                    └─ subsampled_10cm/         │
 └─────────────────────────────────────────────────────────────────────────────────┘
                                           │
@@ -82,7 +83,7 @@ This pipeline provides an end-to-end solution with two primary tasks:
 │  ┌──────────────┐     ┌──────────────┐     ┌──────────────┐                    │
 │  │ Prediction   │     │ Buffer       │     │ Cross-tile   │                    │
 │  │ Remapping    │────▶│ Filtering    │────▶│ Instance     │                    │
-│  │ (10cm→2cm)   │     │              │     │ Matching     │                    │
+│  │ (10cm→1cm)   │     │              │     │ Matching     │                    │
 │  └──────────────┘     └──────────────┘     └──────────────┘                    │
 │                                                   │                            │
 │                                                   ▼                            │
@@ -112,15 +113,16 @@ This pipeline provides an end-to-end solution with two primary tasks:
 - **Parallel subsampling** - each tile is spatially divided into chunks processed concurrently
 
 ### Intelligent Tiling
-- **Configurable tile size** - default 100m × 100m, adjustable for different use cases
-- **Buffer zones** - overlapping regions (default 5m) ensure trees at boundaries are fully captured
+- **Configurable tile size** - default 300m × 300m, adjustable for different use cases
+- **Buffer zones** - overlapping regions (default 20m) ensure trees at boundaries are fully captured
 - **Spatial indexing** - uses PDAL tindex for efficient data retrieval
 - **Data-aligned grid** - tiles start from actual data extent, minimizing empty tiles
+- **Smart tiling threshold** - optional single-file bypass for small datasets
 
 ### Multi-Resolution Processing
-- **Dual subsampling** - generates both 2cm and 10cm resolution outputs
+- **Dual subsampling** - generates both 1cm and 10cm resolution outputs (configurable)
 - **Voxel-based downsampling** - uses PDAL's `voxelcentroidnearestneighbor` filter
-- **Dimension preservation** - all extra dimensions (PredInstance, species_id, etc.) are maintained
+- **Dimension preservation** - all extra dimensions (PredInstance, species_id, etc.) are maintained by default
 
 ### Smart Instance Merging
 - **Centroid-based filtering** - removes duplicate instances in buffer zones
@@ -140,18 +142,18 @@ This pipeline provides an end-to-end solution with two primary tasks:
 
 | Stage | Component | Description |
 |-------|-----------|-------------|
-| 1 | **COPC Conversion** | Converts input LAZ/LAS files to Cloud-Optimized Point Cloud (COPC) format using `untwine`. Optional XYZ-only reduction for ~37% size savings. |
+| 1 | **COPC Conversion** | Converts input LAZ/LAS files to Cloud-Optimized Point Cloud (COPC) format using `untwine`. By default preserves all dimensions. |
 | 2 | **Spatial Index** | Creates a GeoPackage tindex using `pdal tindex` for efficient spatial queries across all input files. |
-| 3 | **Tile Bounds** | Calculates optimal tile grid based on data extent, tile size, and buffer parameters. |
+| 3 | **Tile Bounds** | Calculates optimal tile grid based on data extent, tile size (default: 300m), and buffer (default: 20m) parameters. |
 | 4 | **Tile Creation** | Extracts point data for each tile from COPC files using spatial bounds queries. |
-| 5 | **Subsampling R1** | Downsamples tiles to resolution 1 (default: 2cm) using parallel chunk processing. |
+| 5 | **Subsampling R1** | Downsamples tiles to resolution 1 (default: 1cm) using parallel chunk processing. |
 | 6 | **Subsampling R2** | Further downsamples to resolution 2 (default: 10cm) for neural network inference. |
 
 #### MERGE TASK: Result Integration
 
 | Stage | Component | Description |
 |-------|-----------|-------------|
-| 0 | **Prediction Remapping** | Transfers PredInstance labels from 10cm predictions to 2cm resolution using KDTree nearest-neighbor lookup. |
+| 0 | **Prediction Remapping** | Transfers PredInstance labels from 10cm predictions to 1cm resolution using KDTree nearest-neighbor lookup. |
 | 1 | **Load and Filter** | Loads tiles, applies centroid-based buffer zone filtering to remove duplicate instances. |
 | 2 | **Global ID Assignment** | Creates unique instance IDs across all tiles using tile-specific offsets. |
 | 3 | **Cross-tile Matching** | Identifies matching instances in tile overlaps using overlap ratio and centroid distance (Union-Find grouping). |
@@ -249,14 +251,12 @@ python src/run.py --show-params
 python src/run.py --task tile \
     --input-dir /path/to/input \           # Required: Directory with LAZ/LAS files
     --output-dir /path/to/output \         # Required: Output directory
-    --tile-length 100 \                    # Tile size in meters (default: 100)
-    --tile-buffer 5 \                      # Buffer overlap in meters (default: 5)
-    --resolution-1 0.02 \                  # First resolution (default: 2cm)
+    --tile-length 300 \                    # Tile size in meters (default: 300)
+    --tile-buffer 20 \                     # Buffer overlap in meters (default: 20)
+    --resolution-1 0.01 \                  # First resolution (default: 1cm)
     --resolution-2 0.1 \                   # Second resolution (default: 10cm)
     --workers 8 \                          # Parallel workers (default: 4)
-    --threads 5 \                          # Threads per COPC writer (default: 5)
-    --grid-offset 1.0 \                    # Grid offset from min coords (default: 1.0)
-    --skip-dimension-reduction             # Keep all dimensions (default: XYZ-only)
+    --threads 5                            # Threads per COPC writer (default: 5)
 ```
 
 ### Merge Task Options
@@ -286,16 +286,16 @@ python src/run.py --task merge \
 **Technology**: Uses `untwine` for efficient COPC creation with spatial indexing.
 
 **Options**:
-- **Default (XYZ-only)**: Reduces dimensions to X, Y, Z only, achieving ~37% file size reduction
-- **Full dimensions**: Use `--skip-dimension-reduction` to preserve all attributes
+- **Default (preserve all dimensions)**: Keeps all point attributes (PredInstance, species_id, etc.)
+- **XYZ-only**: Set `--skip-dimension-reduction false` to reduce to X, Y, Z only for ~37% file size reduction (useful for raw pre-segmentation data)
 
 **Example**:
 ```bash
-# XYZ-only (smaller files, faster processing)
+# Preserve all dimensions (default, for post-segmentation data)
 python src/run.py --task tile --input-dir /data/in --output-dir /data/out
 
-# Preserve all dimensions
-python src/run.py --task tile --input-dir /data/in --output-dir /data/out --skip-dimension-reduction
+# XYZ-only (for raw pre-segmentation data)
+python src/run.py --task tile --input-dir /data/in --output-dir /data/out --skip-dimension-reduction false
 ```
 
 ### Stage 2: Spatial Indexing
@@ -352,15 +352,15 @@ python src/run.py --task tile --input-dir /data/in --output-dir /data/out --skip
 
 ### Stage 0: Prediction Remapping
 
-**Purpose**: Transfer predictions from low-resolution (10cm) back to high-resolution (2cm).
+**Purpose**: Transfer predictions from low-resolution (10cm) back to high-resolution (1cm by default).
 
 **Algorithm**: KDTree nearest-neighbor lookup
 
 **Process**:
 1. Load 10cm segmented file with `PredInstance` attribute
-2. Load corresponding 2cm subsampled file
+2. Load corresponding 1cm subsampled file
 3. Build KDTree from 10cm points
-4. Query nearest neighbors for all 2cm points
+4. Query nearest neighbors for all 1cm points
 5. Transfer `PredInstance` (and `species_id` if present)
 
 **Output**: `{tile_id}_segmented_remapped.laz`
@@ -462,7 +462,6 @@ python src/run.py --task tile --input-dir /data/in --output-dir /data/out --skip
 
 **Parameters**:
 - `--retile-buffer`: Controls how much to expand the bounding box when filtering merged points (default: 1.0m). Larger values include more merged points in the local KDTree, improving boundary coverage.
-- `--retile-max-radius`: Maximum distance threshold for nearest neighbor matching (default: 0.1m). Should be set based on subsampling resolution (e.g., 0.1m for 2cm voxels).
 
 ---
 
@@ -472,31 +471,33 @@ python src/run.py --task tile --input-dir /data/in --output-dir /data/out --skip
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--tile-length` | 100 | Tile size in meters |
-| `--tile-buffer` | 5 | Buffer overlap in meters |
+| `--tile-length` | 300 | Tile size in meters |
+| `--tile-buffer` | 20 | Buffer overlap in meters |
 | `--threads` | 5 | Spatial chunks per file during subsampling |
 | `--workers` | 4 | Parallel file/tile processing |
-| `--resolution-1` | 0.02 | First subsampling resolution (2cm) |
+| `--resolution-1` | 0.01 | First subsampling resolution (1cm) |
 | `--resolution-2` | 0.1 | Second subsampling resolution (10cm) |
-| `--grid-offset` | 1.0 | Grid offset from min coordinates |
-| `--skip-dimension-reduction` | False | Keep all point dimensions |
+| `--skip-dimension-reduction` | True | Keep all point dimensions (default: preserve all) |
+| `--tiling-threshold` | None | File size threshold in MB for skipping tiling on single small files |
 
 ### Merge Task Parameters
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--target-resolution` | 2 | Target resolution in cm |
 | `--buffer` | 10.0 | Buffer distance for filtering (meters) |
 | `--border-zone-width` | 10.0 | Width of border zone beyond buffer for instance matching (meters) |
 | `--overlap-threshold` | 0.3 | Overlap ratio for instance matching (30%) |
 | `--max-centroid-distance` | 3.0 | Max centroid distance to merge (meters) |
 | `--correspondence-tolerance` | 0.05 | Point correspondence tolerance (meters) |
 | `--max-volume-for-merge` | 4.0 | Max volume for small instance merge (m³) |
+| `--min-cluster-size` | 300 | Minimum cluster size in points for reassignment |
 | `--original-input-dir` | None | Directory with original input LAZ files for final remap |
 | `--skip-merged-file` | False | Skip creating merged LAZ file (only create retiled outputs) |
+| `--disable-matching` | False | Disable cross-tile instance matching |
+| `--disable-volume-merge` | False | Disable small volume instance merging |
 | `--workers` | 4 | Parallel processing (tile loading, KDTree queries) |
 | `--retile-buffer` | 1.0 | Spatial buffer expansion for filtering merged points during retiling (meters) |
-| `--retile-max-radius` | 0.1 | Maximum distance for cKDTree nearest neighbor matching during retiling (meters) |
+| `--tolerance` | 5.0 | Maximum difference in meters for bounds matching in remap task |
 
 ### Understanding `--workers` vs `--threads`
 
@@ -509,7 +510,7 @@ Controls how many files/tasks run simultaneously using Python's `ProcessPoolExec
 | Task | What `--workers` Controls |
 |------|---------------------------|
 | **Tile Task** | Parallel COPC conversions, parallel tile creation |
-| **Merge Task** | Parallel tile loading, parallel convex hull computation, KDTree queries (`workers=-1` uses all CPUs) |
+| **Merge Task** | Parallel tile loading, parallel convex hull computation, KDTree queries |
 
 **Memory impact**: Higher values = more files in memory simultaneously
 
@@ -517,7 +518,7 @@ Controls how many files/tasks run simultaneously using Python's `ProcessPoolExec
 
 Controls spatial chunking during **subsampling only**:
 
-- Each tile is split into `--threads` spatial chunks along the X-axis
+- Each tile is split into `--threads` spatial chunks along the X-axis (default: 5)
 - Chunks are processed in parallel using `ProcessPoolExecutor`
 - Files are processed **sequentially** (one at a time), but each file's chunks run in parallel
 
@@ -527,6 +528,10 @@ Example with --threads=5:
 ```
 
 **Memory impact**: Higher values = smaller chunks = less memory per chunk
+
+#### `--num-spatial-chunks`
+
+Optional override for number of spatial chunks per tile during subsampling. If not specified, defaults to the value of `--workers`.
 
 
 
@@ -550,30 +555,38 @@ Example with --threads=5:
 
 ```
 output_dir/
-├── copc_xyz/                    # COPC files (XYZ-only or full)
+├── copc_YYYYMMDD_HHMMSS/        # COPC files (preserves all dimensions by default)
 │   ├── input_file_1.copc.laz
 │   └── input_file_2.copc.laz
 │
-├── tiles_100m/                  # Tiled point clouds
+├── tiles_300m/                  # Tiled point clouds (300m default)
 │   ├── c00_r00.copc.laz
 │   ├── c00_r01.copc.laz
 │   ├── c01_r00.copc.laz
 │   │
-│   ├── subsampled_2cm/          # Resolution 1 subsamples
-│   │   ├── output_100m_c00_r00_2cm.laz
+│   ├── subsampled_1cm/          # Resolution 1 subsamples (1cm default)
+│   │   ├── output_300m_c00_r00_1cm.laz
 │   │   └── ...
 │   │
-│   └── subsampled_10cm/         # Resolution 2 subsamples
-│       ├── output_100m_c00_r00_10cm.laz
+│   ├── subsampled_10cm/         # Resolution 2 subsamples
+│   │   ├── output_300m_c00_r00_10cm.laz
+│   │   └── ...
+│   │
+│   ├── segmented_remapped/      # Remapped predictions
+│   │   ├── c00_r00_segmented_remapped.laz
+│   │   └── ...
+│   │
+│   └── output_tiles/            # Final per-tile outputs with merged IDs
+│       ├── c00_r00.copc.laz
 │       └── ...
 │
 ├── original_with_predictions/   # Original files with PredInstance
 │   ├── input_file_1.laz
 │   └── input_file_2.laz
 │
-├── tindex_100m.gpkg             # Spatial index
+├── tindex_300m.gpkg             # Spatial index
 ├── tile_bounds_tindex.json      # Tile metadata
-├── tile_jobs_100m.txt           # Processing jobs
+├── tile_jobs_300m.txt           # Processing jobs
 ├── overview_copc_tiles.png      # Visualization
 │
 └── logs/                        # Processing logs
@@ -597,48 +610,102 @@ output_dir/
 
 ### Large Dataset Processing
 
-For datasets exceeding 100GB:
+For datasets exceeding 100GB with larger tiles:
 
 ```bash
 python src/run.py --task tile \
     --input-dir /data/input \
     --output-dir /data/output \
-    --tile-length 200 \
-    --tile-buffer 15 \
+    --tile-length 500 \
+    --tile-buffer 30 \
     --workers 32 \
     --threads 10
 ```
 
 ### High-Precision Processing
 
-For research applications requiring maximum fidelity:
+For research applications requiring maximum fidelity (already default):
 
 ```bash
 python src/run.py --task tile \
     --input-dir /data/input \
     --output-dir /data/output \
-    --tile-length 50 \
-    --tile-buffer 10 \
+    --tile-length 300 \
+    --tile-buffer 20 \
     --resolution-1 0.01 \
-    --resolution-2 0.05 \
-    --skip-dimension-reduction
+    --resolution-2 0.05
 ```
 
 ### Memory-Constrained Systems
 
-For systems with limited RAM:
+For systems with limited RAM (smaller tiles, lower resolution):
 
 ```bash
 python src/run.py --task tile \
     --input-dir /data/input \
     --output-dir /data/output \
-    --tile-length 50 \
-    --tile-buffer 5 \
+    --tile-length 100 \
+    --tile-buffer 10 \
     --workers 2 \
     --threads 2 \
-    --resolution-1 0.03 \
+    --resolution-1 0.02 \
     --resolution-2 0.15
 ```
+
+### Single Small File Processing
+
+For processing single files without tiling:
+
+```bash
+python src/run.py --task tile \
+    --input-dir /data/input \
+    --output-dir /data/output \
+    --tiling-threshold 1000  # Skip tiling if single file < 1000 MB
+```
+
+---
+
+## Docker & Automation
+
+The pipeline includes Docker support for containerized execution and automated workflows with resource monitoring.
+
+### Docker Setup
+
+Build the Docker image:
+
+```bash
+docker build -t 3dtrees_smart_tile .
+```
+
+Run the pipeline in Docker:
+
+```bash
+./run_docker.sh
+```
+
+### Automated Pipeline
+
+For fully automated execution with resource monitoring, see [AUTOMATION_README.md](AUTOMATION_README.md).
+
+Quick start:
+
+```bash
+./run_automated_pipeline.sh 1
+```
+
+This automated workflow:
+- Downloads data from S3
+- Runs tile task (COPC conversion, tiling, subsampling)
+- Adds dummy PredInstance dimension (for testing)
+- Runs remap_merge task with auto-detection of single vs multi-file workflows
+- Tracks CPU and RAM usage throughout the process
+- Generates resource usage logs
+
+### Additional Documentation
+
+- [AUTOMATION_README.md](AUTOMATION_README.md) - Detailed automation and Docker workflow guide
+- [CLAUDE.md](CLAUDE.md) - Quick reference for AI assistants and developers
+- [Dockerfile](Dockerfile) - Container configuration
 
 ---
 
@@ -728,7 +795,12 @@ htop -p $(pgrep -f "python src/run.py")
 │   └── plot_tiles_and_copc.py          # Visualization
 │
 ├── README.md                           # This documentation
-└── README_PARAMETERS.md                # Parameter reference
+├── AUTOMATION_README.md                # Automation and Docker guide
+├── CLAUDE.md                           # Quick reference for developers
+├── Dockerfile                          # Container configuration
+├── run_automated_pipeline.sh           # Automated workflow orchestrator
+├── run_docker.sh                       # Docker execution wrapper
+└── .gitignore                          # Git ignore rules
 ```
 
 ### Module Descriptions
@@ -787,7 +859,7 @@ htop -p $(pgrep -f "python src/run.py")
 
 MIT License
 
-Copyright (c) 2024
+Copyright (c) 2026
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -811,7 +883,7 @@ SOFTWARE.
 
 ## Contributing
 
-Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+Contributions are welcome! Please open an issue or pull request on the project repository.
 
 ## Citation
 
@@ -820,8 +892,8 @@ If you use this pipeline in your research, please cite:
 ```bibtex
 @software{3dtrees_smart_tile,
   title = {3DTrees Smart Tiling Pipeline},
-  author = {Your Name},
-  year = {2024},
+  author = {},
+  year = {2026},
   url = {https://github.com/your-org/3dtrees_smart_tile}
 }
 ```
