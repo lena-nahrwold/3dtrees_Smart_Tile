@@ -48,7 +48,7 @@ def run_merge(
     enable_volume_merge: bool = True,
     skip_merged_file: bool = False,
     verbose: bool = True,
-    retile_buffer: float = 1.0,
+    retile_buffer: float = 2.0,  # Fixed to 2.0m
     retile_max_radius: float = 0.1,
 ) -> Path:
     """
@@ -239,8 +239,8 @@ def main() -> None:
     parser.add_argument(
         "--retile_buffer",
         type=float,
-        default=MERGE_PARAMS.get('retile_buffer', 1.0),
-        help=f"Spatial buffer expansion in meters for retiling (default: {MERGE_PARAMS.get('retile_buffer', 1.0)})"
+        default=2.0,
+        help="Spatial buffer expansion in meters for retiling (fixed: 2.0m)"
     )
 
     parser.add_argument(

@@ -1448,7 +1448,7 @@ def retile_to_original_files(
     chunk_size: int = 1_000_000,
     all_have_species_id: bool = True,
     parallel_tiles: int = 1,
-    retile_buffer: float = 1.0,
+    retile_buffer: float = 2.0,  # Fixed to 2.0m
 ):
     """
     Map merged instance IDs back to original tile point clouds.
@@ -1477,7 +1477,7 @@ def retile_to_original_files(
         chunk_size: Chunk size for reading large files
         all_have_species_id: Whether to include species_id in output
         parallel_tiles: Number of tiles to process in parallel (default: 1 = sequential)
-        retile_buffer: Additional spatial buffer in meters to expand bounding box when filtering merged points (default: 1.0m)
+        retile_buffer: Additional spatial buffer in meters to expand bounding box when filtering merged points (fixed: 2.0m)
     """
     import gc
     from concurrent.futures import ThreadPoolExecutor
@@ -1734,7 +1734,7 @@ def remap_to_original_input_files(
     tolerance: float = 0.1,
     num_threads: int = 8,
     all_have_species_id: bool = True,
-    retile_buffer: float = 1.0,
+    retile_buffer: float = 2.0,  # Fixed to 2.0m
 ):
     """
     Map merged instance IDs back to original input LAZ files (pre-tiling).
@@ -1762,7 +1762,7 @@ def remap_to_original_input_files(
         tolerance: Distance tolerance for point matching (legacy parameter, used for spatial buffer calculation)
         num_threads: Number of threads for KDTree queries (default: 8)
         all_have_species_id: Whether to include species_id in output
-        retile_buffer: Additional spatial buffer in meters to expand bounding box when filtering merged points (default: 1.0m)
+        retile_buffer: Additional spatial buffer in meters to expand bounding box when filtering merged points (fixed: 2.0m)
     """
     from concurrent.futures import ThreadPoolExecutor
     
@@ -1881,7 +1881,7 @@ def merge_tiles(
     enable_volume_merge: bool = True,
     skip_merged_file: bool = False,
     verbose: bool = False,
-    retile_buffer: float = 1.0,
+    retile_buffer: float = 2.0,  # Fixed to 2.0m
     retile_max_radius: float = 2.0,
     debug_instance_ids: Optional[Set[int]] = None,
     match_all_instances: bool = False,
@@ -3572,8 +3572,8 @@ def main():
     parser.add_argument(
         "--retile-buffer",
         type=float,
-        default=1.0,
-        help="Spatial buffer expansion in meters for filtering merged points during retiling (default: 1.0m)",
+        default=2.0,
+        help="Spatial buffer expansion in meters for filtering merged points during retiling (fixed: 2.0m)",
     )
 
     parser.add_argument(

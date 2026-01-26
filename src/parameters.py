@@ -249,8 +249,8 @@ class Parameters(BaseSettings):
     )
     
     retile_buffer: Optional[float] = Field(
-        1.0,
-        description="Spatial buffer expansion in meters for filtering merged points during retiling",
+        2.0,  # Fixed to 2.0m
+        description="Spatial buffer expansion in meters for filtering merged points during retiling (fixed: 2.0m)",
         validation_alias=AliasChoices("retile-buffer", "retile_buffer"),
     )
 
@@ -424,7 +424,7 @@ MERGE_PARAMS = {
     'min_cluster_size': 300,
     'workers': 4,
     'verbose': True,
-    'retile_buffer': 1.0,
+    'retile_buffer': 2.0,  # Fixed to 2.0m
 }
 
 

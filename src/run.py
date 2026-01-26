@@ -272,7 +272,7 @@ def run_merge_task(params: Parameters):
     max_volume_for_merge = params.max_volume_for_merge
     border_zone_width = params.border_zone_width
     min_cluster_size = params.min_cluster_size
-    retile_buffer = params.retile_buffer
+    retile_buffer = 2.0  # Fixed to 2.0m
 
     print("=" * 60)
     print("Running Merge Task (Python Pipeline)")
@@ -459,7 +459,7 @@ def run_remap_merge_task(params: Parameters):
     max_volume_for_merge = params.max_volume_for_merge
     border_zone_width = params.border_zone_width
     min_cluster_size = params.min_cluster_size
-    retile_buffer = params.retile_buffer
+    retile_buffer = 2.0  # Fixed to 2.0m
 
     print("=" * 60)
     print("Running Remap-Merge Task")
