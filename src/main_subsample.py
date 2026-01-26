@@ -469,14 +469,44 @@ def subsample_parallel(
         if stem.endswith('.copc'):
             stem = stem[:-5]
         
-        if output_prefix:
-            # Extract tile ID (c##_r##) pattern
-            import re
-            match = re.search(r'(c\d+_r\d+)', stem)
-            tile_id = match.group(1) if match else stem
-            output_name = f"{output_prefix}_{tile_id}_{res_cm}cm.laz"
+        # Extract original base filename by removing prefixes and resolution suffixes
+        import re
+        base_name = stem
+        
+        # Remove resolution suffix patterns (e.g., "_1cm", "_10cm", "_subsampled0.01m", "_subsampled0.1m")
+        base_name = re.sub(r'_subsampled[\d.]+m$', '', base_name)
+        base_name = re.sub(r'_\d+cm$', '', base_name)
+        
+        # Remove output_prefix if present at the start (e.g., "output_dir_100m_")
+        if output_prefix and base_name.startswith(output_prefix + '_'):
+            base_name = base_name[len(output_prefix) + 1:]
+        
+        # Remove any remaining prefix patterns that look like "something_100m_" or "output_dir_100m_"
+        base_name = re.sub(r'^[^_]+_\d+m_', '', base_name)
+        
+        # For tiled files, try to extract tile ID (c##_r##) pattern
+        tile_match = re.search(r'(c\d+_r\d+)', base_name)
+        if tile_match:
+            # Keep tile ID for tiled files
+            tile_id = tile_match.group(1)
+            # Extract base name before tile ID if there's a prefix
+            base_before_tile = base_name[:tile_match.start()]
+            if base_before_tile and base_before_tile.endswith('_'):
+                base_before_tile = base_before_tile[:-1]
+            # Remove any remaining prefix from base_before_tile
+            if base_before_tile:
+                base_before_tile = re.sub(r'^[^_]+_\d+m_', '', base_before_tile)
+                if base_before_tile:
+                    output_name = f"{base_before_tile}_{tile_id}_subsampled_{res_cm}cm.laz"
+                else:
+                    output_name = f"{tile_id}_subsampled_{res_cm}cm.laz"
+            else:
+                output_name = f"{tile_id}_subsampled_{res_cm}cm.laz"
         else:
-            output_name = f"{stem}_subsampled{resolution}m.laz"
+            # Single file or no tile ID - use clean base name
+            # Remove any remaining prefix patterns
+            base_name = re.sub(r'^[^_]+_\d+m_', '', base_name)
+            output_name = f"{base_name}_subsampled_{res_cm}cm.laz"
         
         output_file = output_dir / output_name
         
@@ -524,11 +554,12 @@ def subsample_parallel(
 
 def run_subsample_pipeline(
     tiles_dir: Path,
-    res1: float = 0.02,
+    res1: float = 0.01,
     res2: float = 0.1,
     num_cores: Optional[int] = None,
     num_threads: Optional[int] = None,
-    output_prefix: Optional[str] = None
+    output_prefix: Optional[str] = None,
+    output_base_dir: Optional[Path] = None
 ) -> Tuple[Path, Path]:
     """
     Run the complete subsampling pipeline.
@@ -541,12 +572,13 @@ def run_subsample_pipeline(
     spatially into num_threads chunks along X-axis and processed in parallel.
     
     Args:
-        tiles_dir: Directory containing tile COPC files
-        res1: First resolution in meters (default: 0.02 = 2cm)
+        tiles_dir: Directory containing tile COPC files (input)
+        res1: First resolution in meters (default: 0.01 = 1cm)
         res2: Second resolution in meters (default: 0.1 = 10cm)
         num_cores: Not used (kept for compatibility)
         num_threads: Number of parallel chunks per file (default: from TILE_PARAMS['threads'])
         output_prefix: Optional prefix for output filenames
+        output_base_dir: Base directory for output (default: parent of tiles_dir)
     
     Returns:
         Tuple of (subsampled_res1_dir, subsampled_res2_dir)
@@ -559,13 +591,17 @@ def run_subsample_pipeline(
     if num_threads is None:
         num_threads = TILE_PARAMS.get('threads', 5)
     
-    # Convert to cm for directory names
+    # Convert to cm for display/filenames (but use simple directory names)
     res1_cm = int(res1 * 100)
     res2_cm = int(res2 * 100)
     
-    # Define output directories
-    subsampled_res1_dir = tiles_dir / f"subsampled_{res1_cm}cm"
-    subsampled_res2_dir = tiles_dir / f"subsampled_{res2_cm}cm"
+    # Define output directories - use output_base_dir if provided, otherwise use tiles_dir's parent
+    if output_base_dir is None:
+        output_base_dir = tiles_dir.parent
+    
+    # Create output directories directly under output_base_dir
+    subsampled_res1_dir = output_base_dir / "subsampled_res1"
+    subsampled_res2_dir = output_base_dir / "subsampled_res2"
     
     print("=" * 60)
     print("3DTrees Subsampling Pipeline")

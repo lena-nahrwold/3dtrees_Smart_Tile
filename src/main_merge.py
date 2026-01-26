@@ -131,7 +131,6 @@ def run_merge(
         skip_merged_file=skip_merged_file,
         verbose=verbose,
         retile_buffer=retile_buffer,
-        retile_max_radius=retile_max_radius,
     )
     
     return output_merged

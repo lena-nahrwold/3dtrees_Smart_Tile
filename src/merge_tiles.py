@@ -376,7 +376,10 @@ def load_tile(
     print(f"Loading {filepath.name}...")
 
     try:
-        with laspy.open(str(filepath), laz_backend=laspy.LazBackend.LazrsParallel) as f:
+        # Use Lazrs (non-parallel) backend when called from ProcessPoolExecutor workers
+        # LazrsParallel can cause deadlocks when used inside multiprocessing worker processes
+        # The parallelism is already handled by ProcessPoolExecutor
+        with laspy.open(str(filepath), laz_backend=laspy.LazBackend.Lazrs) as f:
             # Get total point count from header
             n_points = f.header.point_count
 
@@ -3398,7 +3401,6 @@ def merge_tiles(
         num_threads=num_threads,
         all_have_species_id=all_have_species_id,
         retile_buffer=retile_buffer,
-        max_radius=retile_max_radius,
     )
     print(f"  ✓ Stage 6 completed: Retiled to original files")
 

@@ -34,13 +34,13 @@ class Parameters(BaseSettings):
     )
     
     input_dir: Optional[Path] = Field(
-        None,
+        default=None,
         description="Input directory with LAZ/LAS files (required for 'tile' task)",
         validation_alias=AliasChoices("input-dir", "input_dir"),
     )
     
     output_dir: Optional[Path] = Field(
-        None,
+        default=None,
         description="Output directory (required for 'tile' task)",
         validation_alias=AliasChoices("output-dir", "output_dir"),
     )
@@ -98,13 +98,13 @@ class Parameters(BaseSettings):
     )
     
     num_spatial_chunks: Optional[int] = Field(
-        None,
+        default=None,
         description="Number of spatial chunks per tile for subsampling (default: equals workers)",
         validation_alias=AliasChoices("num-spatial-chunks", "num_spatial_chunks"),
     )
 
     tiling_threshold: Optional[float] = Field(
-        None,
+        default=None,
         description="File size threshold in MB. If input folder has single file below this size, skip tiling (only for 'tile' task)",
         validation_alias=AliasChoices("tiling-threshold", "tiling_threshold"),
     )
@@ -114,49 +114,49 @@ class Parameters(BaseSettings):
     # ==========================================================================
     
     subsampled_10cm_folder: Optional[Path] = Field(
-        None,
+        default=None,
         description="Path to subsampled 10cm folder with segmented results (for 'merge' task)",
-        validation_alias=AliasChoices("subsampled-10cm-folder", "subsampled_10cm_folder"),
+        validation_alias=AliasChoices("subsampled-10cm-folder", "subsampled_10cm_folder", "subsampled-segmented-folder"),
     )
     
     subsampled_target_folder: Optional[Path] = Field(
-        None,
+        default=None,
         description="Path to target resolution subsampled folder (auto-derived if not specified)",
         validation_alias=AliasChoices("subsampled-target-folder", "subsampled_target_folder"),
     )
     
     segmented_remapped_folder: Optional[Path] = Field(
-        None,
+        default=None,
         description="Path to segmented remapped folder (for 'merge' task, skip remap step)",
         validation_alias=AliasChoices("segmented-remapped-folder", "segmented_remapped_folder"),
     )
     
     original_tiles_dir: Optional[Path] = Field(
-        None,
+        default=None,
         description="Directory with original tile files for retiling (for 'merge' task)",
         validation_alias=AliasChoices("original-tiles-dir", "original_tiles_dir"),
     )
     
     original_input_dir: Optional[Path] = Field(
-        None,
+        default=None,
         description="Directory with original input LAZ files for final remap (for 'merge' task)",
         validation_alias=AliasChoices("original-input-dir", "original_input_dir"),
     )
     
     output_merged_laz: Optional[Path] = Field(
-        None,
+        default=None,
         description="Output path for merged LAZ file (auto-derived if not specified)",
         validation_alias=AliasChoices("output-merged-laz", "output_merged_laz"),
     )
     
     output_tiles_folder: Optional[Path] = Field(
-        None,
+        default=None,
         description="Output folder for per-tile results (auto-derived if not specified)",
         validation_alias=AliasChoices("output-tiles-folder", "output_tiles_folder"),
     )
     
     output_folder: Optional[Path] = Field(
-        None,
+        default=None,
         description="Output folder for remapped files (auto-derived if not specified)",
         validation_alias=AliasChoices("output-folder", "output_folder"),
     )
@@ -166,13 +166,13 @@ class Parameters(BaseSettings):
     # ==========================================================================
 
     source_folder: Optional[Path] = Field(
-        None,
+        default=None,
         description="Path to source LAZ files (e.g., segmented files) for 'remap' task",
         validation_alias=AliasChoices("source-folder", "source_folder"),
     )
 
     target_folder: Optional[Path] = Field(
-        None,
+        default=None,
         description="Path to target LAZ files (e.g., subsampled files) for 'remap' task",
         validation_alias=AliasChoices("target-folder", "target_folder"),
     )
@@ -182,13 +182,7 @@ class Parameters(BaseSettings):
         description="Maximum difference in meters for bounds matching in remap task (default: 5.0)",
     )
 
-    # Remap parameters (for merge task)
-    target_resolution: Optional[int] = Field(
-        2,
-        description="Target resolution in cm for remapping (default: 2cm)",
-        validation_alias=AliasChoices("target-resolution", "target_resolution"),
-    )
-    
+
     # Merge algorithm parameters
     buffer: Optional[float] = Field(
         10.0,
@@ -356,7 +350,6 @@ def print_params(params: Parameters):
     print("\nMerge Task:")
     print(f"  subsampled_10cm_folder: {params.subsampled_10cm_folder}")
     print(f"  original_input_dir: {params.original_input_dir}")
-    print(f"  target_resolution: {params.target_resolution}")
     print(f"  buffer: {params.buffer}")
     print(f"  overlap_threshold: {params.overlap_threshold}")
     print(f"  max_centroid_distance: {params.max_centroid_distance}")
@@ -402,7 +395,6 @@ def get_merge_params(params: Parameters) -> dict:
 def get_remap_params(params: Parameters) -> dict:
     """Get remap parameters as a dictionary for legacy compatibility."""
     return {
-        'target_resolution_cm': params.target_resolution,
         'workers': params.workers,
     }
 

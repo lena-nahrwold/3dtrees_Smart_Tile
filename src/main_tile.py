@@ -754,7 +754,26 @@ def run_tiling_pipeline(
     if not copc_files:
         raise ValueError("No COPC files created or found")
 
+    # Step 2: Build tindex
+    tindex_file = build_tindex(copc_dir, tindex_file)
+    
+    # Step 3: Calculate tile bounds
+    jobs_file, bounds_json, env = calculate_tile_bounds(
+        tindex_file, tile_length, tile_buffer, output_dir, grid_offset
+    )
+
+    # Symlink tindex to fixed name for Galaxy if needed
+    fixed_tindex = output_dir / "tindex.gpkg"
+    if not fixed_tindex.exists() and tindex_file.exists():
+        if fixed_tindex.is_symlink():
+            fixed_tindex.unlink()
+        fixed_tindex.symlink_to(tindex_file.name)
+
+    # Step 4: Plot the tiles
+    plot_tiles_and_copc.plot_extents(tindex_file, bounds_json, output_dir/"overview_copc_tiles.png")
+
     # Check if we should skip tiling (single small file)
+    # We do this AFTER tindex/plotting so we still get the overview outputs
     if tiling_threshold is not None and len(copc_files) == 1:
         file_size_mb = copc_files[0].stat().st_size / (1024 * 1024)
         if file_size_mb < tiling_threshold:
@@ -768,17 +787,6 @@ def run_tiling_pipeline(
             print(f"  Returning COPC directory for direct subsampling")
             print("=" * 60)
             return copc_dir
-
-    # Step 2: Build tindex
-    tindex_file = build_tindex(copc_dir, tindex_file)
-    
-    # Step 3: Calculate tile bounds
-    jobs_file, bounds_json, env = calculate_tile_bounds(
-        tindex_file, tile_length, tile_buffer, output_dir, grid_offset
-    )
-
-    # Step 4: Plot the tiles
-    plot_tiles_and_copc.plot_extents(tindex_file, bounds_json, output_dir/"overview_copc_tiles.png")
     
     # Step 5: Create tiles
     tile_files = create_tiles(

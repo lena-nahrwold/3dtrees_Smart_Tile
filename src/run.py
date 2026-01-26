@@ -116,9 +116,22 @@ def run_tile_task(params: Parameters):
         tiling_skipped = tiles_dir.name.startswith("copc_")
 
         if tiling_skipped:
-            # Single file case - use simpler output prefix
-            output_prefix = f"{output_dir.name}_single"
-            print(f"  Note: Tiling was skipped, subsampling directly from COPC")
+            # Single file case - create tiles_* directory structure for consistency
+            # Move COPC files to tiles_* directory so subsampling creates consistent structure
+            tiles_dir_normalized = output_dir / f"tiles_{int(tile_length)}m"
+            tiles_dir_normalized.mkdir(exist_ok=True)
+            
+            # Copy/move COPC files to tiles directory
+            import shutil
+            for copc_file in tiles_dir.glob("*.copc.laz"):
+                dest_file = tiles_dir_normalized / copc_file.name
+                if not dest_file.exists():
+                    shutil.copy2(copc_file, dest_file)
+            
+            # Update tiles_dir to use normalized structure
+            tiles_dir = tiles_dir_normalized
+            output_prefix = f"{output_dir.name}_{int(tile_length)}m"
+            print(f"  Note: Tiling was skipped, using normalized directory structure: {tiles_dir}")
         else:
             # Normal tiled case
             output_prefix = f"{output_dir.name}_{int(tile_length)}m"
@@ -130,7 +143,8 @@ def run_tile_task(params: Parameters):
             res2=res2,
             num_cores=workers,
             num_threads=num_spatial_chunks,  # num_spatial_chunks maps to num_threads in the function
-            output_prefix=output_prefix
+            output_prefix=output_prefix,
+            output_base_dir=output_dir  # Output directly to output_dir, not under tiles_dir
         )
         
         print()
@@ -244,12 +258,12 @@ def run_merge_task(params: Parameters):
         sys.exit(1)
     
     # Required arguments - need either subsampled_10cm_folder or segmented_remapped_folder
+    # Note: subsampled_10cm_folder is populated by --subsampled-segmented-folder via alias
     if not params.subsampled_10cm_folder and not params.segmented_remapped_folder:
-        print("Error: --subsampled-10cm-folder or --segmented-remapped-folder is required for merge task")
+        print("Error: --subsampled-segmented-folder (or --subsampled-10cm-folder) or --segmented-remapped-folder is required for merge task")
         sys.exit(1)
     
     # Get parameters from Pydantic model
-    target_resolution = params.target_resolution
     workers = params.workers
     buffer = params.buffer
     overlap_threshold = params.overlap_threshold
@@ -276,24 +290,32 @@ def run_merge_task(params: Parameters):
                 sys.exit(1)
             
             print(f"Input (10cm): {subsampled_10cm_dir}")
-            print(f"Target resolution: {target_resolution}cm")
             print()
             
-            # Derive target folder (2cm) and output folder
-            # The 10cm folder is typically at: tiles_100m/subsampled_10cm
-            # The 2cm folder would be at: tiles_100m/subsampled_2cm
+            # Derive target folder and output folder
+            # The resolution folders are now at: tiles_*/subsampled_res1 and tiles_*/subsampled_res2
+            # For backward compatibility, also check old naming: subsampled_{resolution}cm
             parent_dir = subsampled_10cm_dir.parent
             target_folder = params.subsampled_target_folder
+            
             if target_folder is None:
-                target_folder = parent_dir / f"subsampled_{target_resolution}cm"
+                # Try new naming first (subsampled_res1) as default target
+                target_folder_res1 = parent_dir / "subsampled_res1"
+                if target_folder_res1.exists():
+                    target_folder = target_folder_res1
+                else:
+                    # Fallback or error
+                    pass
             
             output_folder = params.output_folder
             if output_folder is None:
                 output_folder = parent_dir / "segmented_remapped"
             
-            if not target_folder.exists():
-                print(f"Error: Target resolution folder does not exist: {target_folder}")
-                print(f"Expected folder for {target_resolution}cm subsampled tiles")
+            if target_folder is None or not target_folder.exists():
+                print(f"Error: Target resolution folder does not exist or not specified")
+                if target_folder:
+                    print(f"Path: {target_folder}")
+                print(f"Please provide --subsampled-target-folder")
                 sys.exit(1)
             
             # Remap - source is 10cm segmented, target is 2cm subsampled
@@ -569,6 +591,16 @@ def main():
     # If --show-params was found, add it back to remaining_args for Pydantic
     if pre_args.show_params:
         remaining_args = ['--show-params'] + remaining_args
+    
+    # Manually map aliases that Pydantic might not generate flags for
+    # --subsampled-segmented-folder -> --subsampled-10cm-folder
+    mapped_args = []
+    for arg in remaining_args:
+        if arg == '--subsampled-segmented-folder':
+            mapped_args.append('--subsampled-10cm-folder')
+        else:
+            mapped_args.append(arg)
+    remaining_args = mapped_args
     
     # Preprocess boolean flags for Pydantic
     processed_args = [sys.argv[0]] + preprocess_boolean_flags(remaining_args)
