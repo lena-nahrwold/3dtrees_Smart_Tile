@@ -1295,16 +1295,16 @@ def load_merged_file(
 def _process_single_tile(args):
     """
     Process a single tile for retiling. Designed to be called in parallel.
-    
+
     Args:
-        args: Tuple of (orig_file, output_file, merged_points, merged_instances, 
-              merged_species_ids, tolerance, spatial_buffer, kdtree_workers, all_have_species_id, max_radius)
-    
+        args: Tuple of (orig_file, output_file, merged_points, merged_instances,
+              merged_species_ids, tolerance, spatial_buffer, kdtree_workers, all_have_species_id)
+
     Returns:
         Tuple of (filename, matched_count, total_count, unique_instances, success, message)
     """
     (orig_file, output_file, merged_points, merged_instances, merged_species_ids,
-     tolerance, spatial_buffer, kdtree_workers, all_have_species_id, max_radius) = args
+     tolerance, spatial_buffer, kdtree_workers, all_have_species_id) = args
     
     try:
         # Get tile bounds from header without loading all points
@@ -1348,11 +1348,10 @@ def _process_single_tile(args):
         new_instances = np.zeros(n_orig_points, dtype=np.int32)
         new_species = np.zeros(n_orig_points, dtype=np.int32)
 
-        # Assign tree points to nearest neighbor (within max_radius)
-        # Points beyond max_radius are kept as ground (instance=0)
-        valid_mask = distances < max_radius
-        new_instances[valid_mask] = local_merged_instances[indices[valid_mask]]
-        new_species[valid_mask] = local_merged_species[indices[valid_mask]]
+        # Assign all points to their nearest neighbor (no distance threshold)
+        # This matches the behavior of the remap task
+        new_instances = local_merged_instances[indices]
+        new_species = local_merged_species[indices]
 
         # Create a completely fresh header to avoid COPC format issues
         # (laspy can read COPC but cannot write it - the old header contains COPC VLRs)
@@ -1426,9 +1425,9 @@ def _process_single_tile(args):
         del orig_las
         del output_las
 
-        matched = int(np.sum(valid_mask))
+        matched = int(np.sum(new_instances > 0))
         unique_inst = len(np.unique(new_instances[new_instances > 0]))
-        
+
         return (orig_file.name, matched, n_orig_points, unique_inst, True, "OK")
     
     except Exception as e:
@@ -1447,7 +1446,6 @@ def retile_to_original_files(
     all_have_species_id: bool = True,
     parallel_tiles: int = 1,
     retile_buffer: float = 1.0,
-    max_radius: float = 2.0,
 ):
     """
     Map merged instance IDs back to original tile point clouds.
@@ -1477,7 +1475,6 @@ def retile_to_original_files(
         all_have_species_id: Whether to include species_id in output
         parallel_tiles: Number of tiles to process in parallel (default: 1 = sequential)
         retile_buffer: Additional spatial buffer in meters to expand bounding box when filtering merged points (default: 1.0m)
-        max_radius: Maximum distance threshold in meters for cKDTree nearest neighbor matching (default: 2.0m)
     """
     import gc
     from concurrent.futures import ThreadPoolExecutor
@@ -1532,7 +1529,7 @@ def retile_to_original_files(
     
     process_args = [
         (orig_file, output_file, merged_points, merged_instances, merged_species_ids,
-         tolerance, spatial_buffer, kdtree_workers, all_have_species_id, max_radius)
+         tolerance, spatial_buffer, kdtree_workers, all_have_species_id)
         for orig_file, output_file in tiles_to_process
     ]
 
@@ -1583,16 +1580,16 @@ def retile_to_original_files(
 def _process_single_original_input_file(args):
     """
     Process a single original input LAZ file for remapping. Designed to be called in parallel.
-    
+
     Args:
-        args: Tuple of (input_file, output_file, merged_points, merged_instances, 
-              merged_species_ids, tolerance, spatial_buffer, kdtree_workers, all_have_species_id, max_radius)
-    
+        args: Tuple of (input_file, output_file, merged_points, merged_instances,
+              merged_species_ids, tolerance, spatial_buffer, kdtree_workers, all_have_species_id)
+
     Returns:
         Tuple of (filename, matched_count, total_count, unique_instances, success, message)
     """
     (input_file, output_file, merged_points, merged_instances, merged_species_ids,
-     tolerance, spatial_buffer, kdtree_workers, all_have_species_id, max_radius) = args
+     tolerance, spatial_buffer, kdtree_workers, all_have_species_id) = args
     
     try:
         # Get file bounds from header without loading all points
@@ -1636,14 +1633,13 @@ def _process_single_original_input_file(args):
         new_instances = np.zeros(n_input_points, dtype=np.int32)
         new_species = np.zeros(n_input_points, dtype=np.int32)
 
-        # Assign ALL points to nearest neighbor (merged points are from subsampled Resolution_1)
-        # Use max_radius parameter for distance threshold
-        # Points beyond this are likely outside the processed area and remain 0
-        max_distance = max_radius  # Maximum distance to assign
-        valid_mask = distances < max_distance
-        matched_count = np.sum(valid_mask)
-        new_instances[valid_mask] = local_merged_instances[indices[valid_mask]]
-        new_species[valid_mask] = local_merged_species[indices[valid_mask]]
+        # Assign all points to their nearest neighbor (no distance threshold)
+        # This matches the behavior of the remap task
+        new_instances = local_merged_instances[indices]
+        new_species = local_merged_species[indices]
+
+        # Count matched points (non-zero instances)
+        matched_count = int(np.sum(new_instances > 0))
 
         # Count unique non-zero instances
         unique_instances = len(np.unique(new_instances[new_instances > 0]))
@@ -1736,11 +1732,10 @@ def remap_to_original_input_files(
     num_threads: int = 8,
     all_have_species_id: bool = True,
     retile_buffer: float = 1.0,
-    max_radius: float = 2.0,
 ):
     """
     Map merged instance IDs back to original input LAZ files (pre-tiling).
-    
+
     This is the final stage of the pipeline that transfers PredInstance labels
     from the merged/processed point cloud back to the original input files,
     ensuring ALL original points have the new dimension.
@@ -1750,12 +1745,10 @@ def remap_to_original_input_files(
     - Build local cKDTree from filtered merged points
     - Query nearest neighbor for all original points
     - Add PredInstance dimension with queried values
-    - Points within max_radius of a merged point get assigned (accounts for subsampling)
-    - Points beyond max_radius remain PredInstance=0 (likely outside processed area)
+    - All points are assigned to their nearest neighbor (no distance threshold)
 
-    Note: Merged points come from subsampled Resolution_1 tiles, so we use a
-    generous maximum distance (controlled by max_radius parameter) instead of strict tolerance to ensure
-    all original points in the processed area get assigned.
+    Note: This matches the behavior of the remap task where all points are
+    assigned to their nearest neighbor regardless of distance.
 
     Args:
         merged_points: Merged point cloud coordinates (N, 3)
@@ -1767,7 +1760,6 @@ def remap_to_original_input_files(
         num_threads: Number of threads for KDTree queries (default: 8)
         all_have_species_id: Whether to include species_id in output
         retile_buffer: Additional spatial buffer in meters to expand bounding box when filtering merged points (default: 1.0m)
-        max_radius: Maximum distance threshold in meters for cKDTree nearest neighbor matching (default: 2.0m)
     """
     from concurrent.futures import ThreadPoolExecutor
     
@@ -1826,7 +1818,7 @@ def remap_to_original_input_files(
     
     process_args = [
         (input_file, output_file, merged_points, merged_instances, merged_species_ids,
-         tolerance, spatial_buffer, kdtree_workers, all_have_species_id, max_radius)
+         tolerance, spatial_buffer, kdtree_workers, all_have_species_id)
         for input_file, output_file in files_to_process
     ]
 
@@ -1937,7 +1929,6 @@ def merge_tiles(
             num_threads=num_threads,
             all_have_species_id=all_have_species_id,
             retile_buffer=retile_buffer,
-            max_radius=retile_max_radius,
         )
         print(f"  ✓ Stage 6 completed: Retiled to original files")
 
@@ -3432,7 +3423,6 @@ def merge_tiles(
             num_threads=num_threads,
             all_have_species_id=all_have_species_id,
             retile_buffer=retile_buffer,
-            max_radius=retile_max_radius,
         )
         print(f"  ✓ Stage 7 completed: Remapped to original input files")
     else:

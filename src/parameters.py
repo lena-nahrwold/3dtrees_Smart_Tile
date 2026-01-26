@@ -264,13 +264,7 @@ class Parameters(BaseSettings):
         description="Spatial buffer expansion in meters for filtering merged points during retiling",
         validation_alias=AliasChoices("retile-buffer", "retile_buffer"),
     )
-    
-    retile_max_radius: Optional[float] = Field(
-        0.1,
-        description="Maximum distance threshold in meters for cKDTree nearest neighbor matching during retiling",
-        validation_alias=AliasChoices("retile-max-radius", "retile_max_radius"),
-    )
-    
+
     # ==========================================================================
     # Validators
     # ==========================================================================
@@ -411,7 +405,6 @@ def get_merge_params(params: Parameters) -> dict:
         'workers': params.workers,
         'verbose': params.verbose,
         'retile_buffer': params.retile_buffer,
-        'retile_max_radius': params.retile_max_radius,
     }
 
 
@@ -450,7 +443,6 @@ MERGE_PARAMS = {
     'workers': 4,
     'verbose': True,
     'retile_buffer': 1.0,
-    'retile_max_radius': 0.1,
 }
 
 

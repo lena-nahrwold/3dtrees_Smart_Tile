@@ -262,8 +262,7 @@ def run_merge_task(params: Parameters):
     border_zone_width = params.border_zone_width
     min_cluster_size = params.min_cluster_size
     retile_buffer = params.retile_buffer
-    retile_max_radius = params.retile_max_radius
-    
+
     print("=" * 60)
     print("Running Merge Task (Python Pipeline)")
     print("=" * 60)
@@ -362,7 +361,6 @@ def run_merge_task(params: Parameters):
             skip_merged_file=params.skip_merged_file,
             verbose=params.verbose,
             retile_buffer=retile_buffer,
-            retile_max_radius=retile_max_radius,
         )
         
         print()
@@ -443,7 +441,6 @@ def run_remap_merge_task(params: Parameters):
     border_zone_width = params.border_zone_width
     min_cluster_size = params.min_cluster_size
     retile_buffer = params.retile_buffer
-    retile_max_radius = params.retile_max_radius
 
     print("=" * 60)
     print("Running Remap-Merge Task")
@@ -516,7 +513,6 @@ def run_remap_merge_task(params: Parameters):
             skip_merged_file=params.skip_merged_file,
             verbose=params.verbose,
             retile_buffer=retile_buffer,
-            retile_max_radius=retile_max_radius,
         )
 
         print()
