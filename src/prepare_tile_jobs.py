@@ -68,10 +68,21 @@ def write_job_list(bounds_json: Path, job_file: Path) -> None:
         data = json.load(f)
 
     # Get SRS from tile bounds data
-    srs = data.get("srs", "EPSG:32632")
-    transformer = Transformer.from_crs(srs, "EPSG:4326", always_xy=True)
+    # get_bounds_from_tindex.py uses 'proj_srs' for the working projection
+    srs = data.get("proj_srs", data.get("tindex_srs", "missing"))
+    
+    transformer = None
+    if srs != "missing":
+        try:
+            transformer = Transformer.from_crs(srs, "EPSG:4326", always_xy=True)
+        except Exception as e:
+            print(f"[prepare_tile_jobs] Warning: Could not create transformer from {srs} to EPSG:4326: {e}", file=sys.stderr)
 
     def to_geo_bounds(bx: List[float], by: List[float]) -> Tuple[List[float], List[float]]:
+        if transformer is None:
+            # Fallback: if no transformer, return original bounds (planar units)
+            return bx, by
+            
         corners = [
             transformer.transform(bx[0], by[0]),
             transformer.transform(bx[0], by[1]),

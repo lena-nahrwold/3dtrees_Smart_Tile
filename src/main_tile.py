@@ -345,6 +345,20 @@ def build_tindex(copc_dir: Path, output_gpkg: Path) -> Path:
     if not copc_files:
         raise ValueError(f"No COPC files found in {copc_dir}")
     
+    # Try to get SRS from the first COPC file to avoid default EPSG:4326 in tindex
+    tindex_srs = None
+    try:
+        pdal_cmd = get_pdal_path()
+        info_cmd = [pdal_cmd, "info", "--metadata", str(copc_files[0])]
+        info_result = subprocess.run(info_cmd, capture_output=True, text=True, check=False)
+        if info_result.returncode == 0:
+            meta = json.loads(info_result.stdout)
+            # Try various places where SRS might be stored
+            tindex_srs = meta.get("metadata", {}).get("srs", {}).get("compoundwkt") or \
+                         meta.get("metadata", {}).get("spatialreference")
+    except Exception as e:
+        print(f"  Warning: Could not extract SRS for tindex: {e}")
+
     print(f"  Found {len(copc_files)} COPC files")
     print(f"  Output: {output_gpkg}")
     
@@ -366,6 +380,9 @@ def build_tindex(copc_dir: Path, output_gpkg: Path) -> Path:
             "--fast_boundary",
             "--write_absolute_path"
         ]
+        
+        if tindex_srs:
+            cmd.append(f"--tindex_srs={tindex_srs}")
         
         with open(file_list_path, 'r') as f:
             result = subprocess.run(

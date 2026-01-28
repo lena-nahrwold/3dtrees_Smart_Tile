@@ -1950,11 +1950,10 @@ def merge_tiles(
                 merged_species_ids,
                 original_input_dir,
                 original_output_dir,
-                tolerance=0.1,
+                tolerance=retile_max_radius,  # Use retile_max_radius as tolerance parameter
                 num_threads=num_threads,
                 all_have_species_id=all_have_species_id,
                 retile_buffer=retile_buffer,
-                max_radius=retile_max_radius,
             )
             print(f"  ✓ Stage 7 completed: Remapped to original input files")
         else:
