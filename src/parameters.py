@@ -177,12 +177,6 @@ class Parameters(BaseSettings):
         validation_alias=AliasChoices("target-folder", "target_folder"),
     )
 
-    tolerance: Optional[float] = Field(
-        5.0,
-        description="Maximum difference in meters for bounds matching in remap task (default: 5.0)",
-    )
-
-
     # Merge algorithm parameters
     buffer: Optional[float] = Field(
         10.0,

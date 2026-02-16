@@ -94,7 +94,87 @@ def run_merge(
     # Auto-derive output path if not provided
     if output_merged is None:
         output_merged = segmented_dir.parent / "merged.laz"
-    
+
+    # OPTIMIZATION: If only one file in each folder, skip merge and just remap
+    segmented_files = list(segmented_dir.glob("*.laz")) + list(segmented_dir.glob("*.las"))
+    original_tiles_files = list(original_tiles_dir.glob("*.laz")) + list(original_tiles_dir.glob("*.las"))
+
+    # Check if we should use the single-file optimization
+    use_single_file_optimization = False
+    if len(segmented_files) == 1 and len(original_tiles_files) == 1:
+        # If original_input_dir is provided, also check it has exactly one file
+        if original_input_dir:
+            original_input_files = list(original_input_dir.glob("*.laz")) + list(original_input_dir.glob("*.las"))
+            # Filter out COPC files
+            original_input_files = [f for f in original_input_files if not f.name.endswith('.copc.laz')]
+            if len(original_input_files) == 1:
+                use_single_file_optimization = True
+        else:
+            # No original_input_dir requirement
+            use_single_file_optimization = True
+
+    if use_single_file_optimization:
+        print("\n" + "=" * 60)
+        print("SINGLE FILE DETECTED - Using optimized path")
+        print("=" * 60)
+        print(f"Segmented files: {len(segmented_files)}")
+        print(f"Original tiles: {len(original_tiles_files)}")
+        if original_input_dir:
+            print(f"Original inputs: {len(original_input_files)}")
+        print("\nSkipping merge steps (no cross-tile matching needed)")
+        print("Directly remapping segmented → 1cm → original")
+        print()
+
+        # Import remap function
+        from main_remap import remap_single_tile
+
+        # Step 1: Remap segmented to 1cm (original_tiles)
+        segmented_file = segmented_files[0]
+        target_file = original_tiles_files[0]
+
+        print(f"Step 1: Remapping {segmented_file.name} → {target_file.name}")
+        remapped_1cm_file = output_tiles_dir / f"{target_file.stem}_segmented.laz"
+
+        _, success, message, point_count = remap_single_tile(
+            segmented_file,
+            target_file,
+            remapped_1cm_file
+        )
+
+        if not success:
+            raise RuntimeError(f"Failed to remap to 1cm: {message}")
+
+        print(f"  ✓ Remapped {point_count:,} points to 1cm resolution")
+
+        # Step 2: If original_input_dir provided, remap to original
+        if original_input_dir:
+            original_file = original_input_files[0]
+            print(f"\nStep 2: Remapping {remapped_1cm_file.name} → {original_file.name}")
+
+            final_output_file = output_tiles_dir / f"{original_file.stem}_segmented.laz"
+
+            _, success, message, point_count = remap_single_tile(
+                remapped_1cm_file,
+                original_file,
+                final_output_file
+            )
+
+            if not success:
+                raise RuntimeError(f"Failed to remap to original: {message}")
+
+            print(f"  ✓ Remapped {point_count:,} points to original resolution")
+
+            # Clean up intermediate file
+            remapped_1cm_file.unlink()
+            print(f"  Removed intermediate file: {remapped_1cm_file.name}")
+
+        print("\n" + "=" * 60)
+        print("Single-file optimization complete")
+        print("=" * 60)
+        print(f"Output: {output_tiles_dir}")
+
+        return output_merged
+
     print(f"Input: {segmented_dir}")
     print(f"Output merged: {output_merged}" + (" (SKIPPED)" if skip_merged_file else ""))
     print(f"Buffer: {buffer}m")
