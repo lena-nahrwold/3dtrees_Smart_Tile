@@ -6,3 +6,5 @@ out/*
 *md
 run_*
 scripts/*
+data
+notes.txt
