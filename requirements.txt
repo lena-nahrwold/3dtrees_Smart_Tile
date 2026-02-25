@@ -1,0 +1,10 @@
+laspy
+lazrs
+numpy
+scipy
+matplotlib
+fiona
+pyproj
+pydantic
+pydantic-settings
+plyfile
