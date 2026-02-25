@@ -390,9 +390,15 @@ def build_tindex(copc_dir: Path, output_gpkg: Path) -> Path:
         info_result = subprocess.run(info_cmd, capture_output=True, text=True, check=False)
         if info_result.returncode == 0:
             meta = json.loads(info_result.stdout)
-            # Try various places where SRS might be stored
-            tindex_srs = meta.get("metadata", {}).get("srs", {}).get("compoundwkt") or \
-                         meta.get("metadata", {}).get("spatialreference")
+            srs_json = meta.get("summary", {}).get("srs", {}).get("json", {})
+            if srs_json:
+                for comp in srs_json.get("components", []):
+                    if comp.get("type") == "ProjectedCRS":
+                        code = comp.get("id", {}).get("code")
+                        auth = comp.get("id", {}).get("authority", "EPSG")
+                        if code:
+                            tindex_srs = f"{auth}:{code}"
+                            break
     except Exception as e:
         print(f"  Warning: Could not extract SRS for tindex: {e}")
 
@@ -418,8 +424,8 @@ def build_tindex(copc_dir: Path, output_gpkg: Path) -> Path:
             "--write_absolute_path"
         ]
         
-        #if tindex_srs:
-        #    cmd.append(f"--t_srs={tindex_srs}")
+        if tindex_srs:
+            cmd.append(f"--t_srs={tindex_srs}")
         
         with open(file_list_path, 'r') as f:
             result = subprocess.run(
