@@ -386,7 +386,7 @@ def build_tindex(copc_dir: Path, output_gpkg: Path) -> Path:
     tindex_srs = None
     try:
         pdal_cmd = get_pdal_path()
-        info_cmd = [pdal_cmd, "info", "--metadata", str(copc_files[0])]
+        info_cmd = [pdal_cmd, "info", "--summary", str(copc_files[0])]
         info_result = subprocess.run(info_cmd, capture_output=True, text=True, check=False)
         if info_result.returncode == 0:
             meta = json.loads(info_result.stdout)
