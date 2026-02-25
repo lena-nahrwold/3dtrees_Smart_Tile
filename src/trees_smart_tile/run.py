@@ -155,8 +155,8 @@ def run_tile_task(params: Parameters):
         print("Tile Task Complete")
         print("=" * 60)
         print(f"Tiles: {tiles_dir}")
-        print(f"Subsampled {int(res1*100)}cm: {res1_dir}")
-        print(f"Subsampled {int(res2*100)}cm: {res2_dir}")
+        #print(f"Subsampled {int(res1*100)}cm: {res1_dir}")
+        #print(f"Subsampled {int(res2*100)}cm: {res2_dir}")
         
         # Return the input_dir for use in merge task if needed
         return input_dir
