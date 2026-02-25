@@ -418,8 +418,8 @@ def build_tindex(copc_dir: Path, output_gpkg: Path) -> Path:
             "--write_absolute_path"
         ]
         
-        if tindex_srs:
-            cmd.append(f"--t_srs={tindex_srs}")
+        #if tindex_srs:
+        #    cmd.append(f"--t_srs={tindex_srs}")
         
         with open(file_list_path, 'r') as f:
             result = subprocess.run(
