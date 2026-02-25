@@ -138,7 +138,6 @@ def run_tile_task(params: Parameters):
             output_prefix = f"{output_dir.name}_{int(tile_length)}m"
 
         # Step 5-6: Subsampling pipeline
-        """
         res1_dir, res2_dir = run_subsample_pipeline(
             tiles_dir=tiles_dir,
             res1=res1,
@@ -148,15 +147,14 @@ def run_tile_task(params: Parameters):
             output_prefix=output_prefix,
             output_base_dir=output_dir  # Output directly to output_dir, not under tiles_dir
         )
-        """
         
         print()
         print("=" * 60)
         print("Tile Task Complete")
         print("=" * 60)
         print(f"Tiles: {tiles_dir}")
-        #print(f"Subsampled {int(res1*100)}cm: {res1_dir}")
-        #print(f"Subsampled {int(res2*100)}cm: {res2_dir}")
+        print(f"Subsampled {int(res1*100)}cm: {res1_dir}")
+        print(f"Subsampled {int(res2*100)}cm: {res2_dir}")
         
         # Return the input_dir for use in merge task if needed
         return input_dir
