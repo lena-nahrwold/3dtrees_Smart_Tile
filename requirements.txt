@@ -8,3 +8,4 @@ pyproj
 pydantic
 pydantic-settings
 plyfile
+gdal==3.8.4

@@ -1,6 +1,6 @@
 Location/*
 src/*/__pycache__/*
-__pycache__/*
+__pycache__/
 out/*
 .serena/*
 *md
