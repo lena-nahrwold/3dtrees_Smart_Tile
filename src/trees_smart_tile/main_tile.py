@@ -582,6 +582,7 @@ def process_single_tile(args: Tuple[str, str, str, List[str], Path, Path, int]) 
                     {
                         "type": "writers.copc",
                         "filename": str(part_file),
+                        #"extra_dims": "all",
                         "forward": "all"
                     }
                 ]
@@ -629,6 +630,7 @@ def process_single_tile(args: Tuple[str, str, str, List[str], Path, Path, int]) 
                         "type": "writers.copc",
                         "filename": str(final_tile),
                         "forward": "all",
+                        #"extra_dims": "all",  # Preserve extra dimensions like PredInstance
                         "scale_x": 0.01,
                         "scale_y": 0.01,
                         "scale_z": 0.01
