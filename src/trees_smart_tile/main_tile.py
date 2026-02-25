@@ -386,19 +386,13 @@ def build_tindex(copc_dir: Path, output_gpkg: Path) -> Path:
     tindex_srs = None
     try:
         pdal_cmd = get_pdal_path()
-        info_cmd = [pdal_cmd, "info", "--summary", str(copc_files[0])]
+        info_cmd = [pdal_cmd, "info", "--metadata", str(copc_files[0])]
         info_result = subprocess.run(info_cmd, capture_output=True, text=True, check=False)
-    
         if info_result.returncode == 0:
             meta = json.loads(info_result.stdout)
-    
-            # Extract horizontal CRS only
-            tindex_srs = (
-                meta.get("summary", {})
-                    .get("srs", {})
-                    .get("horizontal")
-            )
-    
+            # Try various places where SRS might be stored
+            tindex_srs = meta.get("metadata", {}).get("srs", {}).get("compoundwkt") or \
+                         meta.get("metadata", {}).get("spatialreference")
     except Exception as e:
         print(f"  Warning: Could not extract SRS for tindex: {e}")
 
