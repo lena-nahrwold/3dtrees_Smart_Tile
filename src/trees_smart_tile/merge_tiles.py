@@ -148,6 +148,65 @@ def get_tile_bounds_from_header(filepath: Path) -> Optional[Tuple[float, float, 
     except Exception:
         return None
     
+def find_neighbors_by_coordinates_in_filename(
+    tile_name: str,
+    all_tiles: Dict[str, Tuple[float, float, float, float]]  # name -> boundary (unused here)
+) -> Dict[str, Optional[str]]:
+    """
+    Find 4 neighbors based on coordinate filenames like 398700_5646160.laz.
+    Tile size is automatically inferred from filenames.
+    """
+
+    neighbors = {
+        "north": None,
+        "east": None,
+        "south": None,
+        "west": None,
+    }
+
+    # Extract x, y from filename
+    match = re.match(r"(\d+)_(\d+)", tile_name)
+    if not match:
+        raise ValueError(f"Could not extract coordinates from {tile_name}")
+    x = int(match.group(1))
+    y = int(match.group(2))
+
+    # Build fast lookup: (x, y) -> filename
+    index = {}
+    xs = set()
+    ys = set()
+    for name in all_tiles.keys():
+        m = re.match(r"(\d+)_(\d+)", name)
+        if m:
+            xi = int(m.group(1))
+            yi = int(m.group(2))
+            index[(xi, yi)] = name
+            xs.add(xi)
+            ys.add(yi)
+
+    # Infer tile_size from minimum spacing
+    xs = sorted(xs)
+    ys = sorted(ys)
+    dx = min(xs[i+1] - xs[i] for i in range(len(xs)-1)) if len(xs) > 1 else 0
+    dy = min(ys[i+1] - ys[i] for i in range(len(ys)-1)) if len(ys) > 1 else 0
+    tile_size = min(dx, dy)
+
+    # Neighbor offsets
+    directions = {
+        "north": (0, tile_size),
+        "east": (tile_size, 0),
+        "south": (0, -tile_size),
+        "west": (-tile_size, 0),
+    }
+
+    # Find neighbors
+    for direction, (dx, dy) in directions.items():
+        key = (x + dx, y + dy)
+        if key in index:
+            neighbors[direction] = index[key]
+
+    return neighbors
+    
 
 
 def find_neighbors_by_filename(
@@ -438,7 +497,8 @@ def filter_by_centroid_in_buffer(
     min_x, max_x, min_y, max_y = boundary
 
     # Determine which edges have neighbors using spatial bounds
-    neighbors = find_neighbors_by_filename(tile_name, all_tiles) 
+    neighbors = find_neighbors_by_coordinates_in_filename(tile_name, all_tiles)
+    #neighbors = find_neighbors_by_filename(tile_name, all_tiles) 
     #neighbors = find_spatial_neighbors(boundary, tile_name, all_tiles, tolerance=buffer)
 
     # Define buffer zone boundaries (only on edges with neighbors)
@@ -2447,7 +2507,8 @@ def merge_tiles(
     for tile_idx, tile in enumerate(tiles):
         print(f"    Processing tile {tile_idx + 1}/{len(tiles)}: {tile.name} ({len(tile.points):,} points)...")
         tile_name = tile.name
-        neighbors = find_neighbors_by_filename(tile_name, tile_boundaries) 
+        neighbors = find_neighbors_by_coordinates_in_filename(tile_name, tile_boundaries)
+        #neighbors = find_neighbors_by_filename(tile_name, tile_boundaries) 
         #neighbors = find_spatial_neighbors(tile.boundary, tile_name, tile_boundaries, tolerance=buffer)
         kept_instances = kept_instances_per_tile[tile_name]
         
@@ -2649,7 +2710,8 @@ def merge_tiles(
     
     for i in range(len(tiles)):
         tile_a = tiles[i]
-        neighbors_a = find_neighbors_by_filename(tile_a.name, tile_boundaries) 
+        neighbors_a = find_neighbors_by_coordinates_in_filename(tile_a.name, tile_boundaries)
+        #neighbors_a = find_neighbors_by_filename(tile_a.name, tile_boundaries) 
         #neigbors_a = find_spatial_neighbors(tile_a.boundary, tile_a.name, tile_boundaries)
         
         for direction, neighbor_name in neighbors_a.items():
