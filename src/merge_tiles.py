@@ -170,6 +170,8 @@ def find_spatial_neighbors(
         Dictionary with 'east', 'west', 'north', 'south' -> neighbor_name or None
     """
     minx_a, maxx_a, miny_a, maxy_a = tile_boundary
+    tile_width_a = maxx_a - minx_a
+    tile_height_a = maxy_a - miny_a
     
     neighbors = {
         "east": None,
@@ -208,8 +210,28 @@ def find_spatial_neighbors(
         if minx_b > minx_a and minx_b <= maxx_a + tolerance and overlap_width >= tolerance:
             # Check if there's vertical overlap
             if not (maxy_b < miny_a or miny_b > maxy_a):
-                # Store (overlap_area, minx_b - minx_a, other_name) - use distance for tie-breaking
-                east_overlaps.append((overlap_area, minx_b - minx_a, other_name))
+                # Calculate alignment: same row = high alignment
+                # For same row, the vertical overlap should span most of BOTH tiles' heights
+                # OR if overlap spans most of the smaller tile (indicates same row with size mismatch)
+                tile_height_b = maxy_b - miny_b
+                overlap_height_ratio_a = overlap_height / tile_height_a if tile_height_a > 0 else 0.0
+                overlap_height_ratio_b = overlap_height / tile_height_b if tile_height_b > 0 else 0.0
+                # High alignment if:
+                # 1. Both tiles have >80% overlap (perfect alignment)
+                # 2. Exact Y bounds match (perfect alignment)
+                # 3. Smaller tile has >80% overlap (indicates same row with size mismatch)
+                max_ratio = max(overlap_height_ratio_a, overlap_height_ratio_b)
+                y_alignment = 1.0 if (overlap_height_ratio_a > 0.8 and overlap_height_ratio_b > 0.8) or (miny_b == miny_a and maxy_b == maxy_a) or (max_ratio > 0.8) else 0.5
+                # Edge alignment: check if Y edges align (for same-row detection)
+                # Tiles in same row should have miny or maxy very close (within 0.1m tolerance)
+                edge_tolerance = 0.1
+                bottom_edge_align = abs(miny_a - miny_b) < edge_tolerance
+                top_edge_align = abs(maxy_a - maxy_b) < edge_tolerance
+                # Higher score if BOTH edges align (perfect same row), medium if one aligns
+                edge_alignment = 2.0 if (bottom_edge_align and top_edge_align) else (1.0 if (bottom_edge_align or top_edge_align) else 0.0)
+                # Store (overlap_area, y_alignment, minx_b - minx_a, edge_alignment, other_name)
+                # Priority: alignment (same row), then overlap area, then distance, then edge alignment
+                east_overlaps.append((overlap_area, y_alignment, minx_b - minx_a, edge_alignment, other_name))
         
         # West neighbor: other tile extends to the left (west) of this tile
         # The overlap should be on the left side of this tile
@@ -218,11 +240,28 @@ def find_spatial_neighbors(
         if minx_b < minx_a and maxx_b >= minx_a - tolerance and overlap_width >= tolerance:
             # Check if there's vertical overlap
             if not (maxy_b < miny_a or miny_b > maxy_a):
-                # Calculate alignment score: same Y bounds = higher priority
-                y_alignment = 1.0 if (miny_b == miny_a and maxy_b == maxy_a) else 0.5
-                # Store (overlap_area, y_alignment, minx_a - minx_b, other_name)
-                # Priority: max overlap, then same row (y_alignment=1.0), then closer (smaller distance)
-                west_overlaps.append((overlap_area, y_alignment, minx_a - minx_b, other_name))
+                # Calculate alignment: same row = high alignment
+                # For same row, the vertical overlap should span most of BOTH tiles' heights
+                # OR if overlap spans most of the smaller tile (indicates same row with size mismatch)
+                tile_height_b = maxy_b - miny_b
+                overlap_height_ratio_a = overlap_height / tile_height_a if tile_height_a > 0 else 0.0
+                overlap_height_ratio_b = overlap_height / tile_height_b if tile_height_b > 0 else 0.0
+                # High alignment if:
+                # 1. Both tiles have >80% overlap (perfect alignment)
+                # 2. Exact Y bounds match (perfect alignment)
+                # 3. Smaller tile has >80% overlap (indicates same row with size mismatch)
+                max_ratio = max(overlap_height_ratio_a, overlap_height_ratio_b)
+                y_alignment = 1.0 if (overlap_height_ratio_a > 0.8 and overlap_height_ratio_b > 0.8) or (miny_b == miny_a and maxy_b == maxy_a) or (max_ratio > 0.8) else 0.5
+                # Edge alignment: check if Y edges align (for same-row detection)
+                # Tiles in same row should have miny or maxy very close (within 0.1m tolerance)
+                edge_tolerance = 0.1
+                bottom_edge_align = abs(miny_a - miny_b) < edge_tolerance
+                top_edge_align = abs(maxy_a - maxy_b) < edge_tolerance
+                # Higher score if BOTH edges align (perfect same row), medium if one aligns
+                edge_alignment = 2.0 if (bottom_edge_align and top_edge_align) else (1.0 if (bottom_edge_align or top_edge_align) else 0.0)
+                # Store (overlap_area, y_alignment, minx_a - minx_b, edge_alignment, other_name)
+                # Priority: alignment (same row), then overlap area, then distance, then edge alignment
+                west_overlaps.append((overlap_area, y_alignment, minx_a - minx_b, edge_alignment, other_name))
         
         # North neighbor: other tile extends above (north) of this tile
         # The overlap should be on the top side of this tile
@@ -231,11 +270,28 @@ def find_spatial_neighbors(
         if miny_b > miny_a and miny_b <= maxy_a + tolerance and overlap_height >= tolerance:
             # Check if there's horizontal overlap
             if not (maxx_b < minx_a or minx_b > maxx_a):
-                # Calculate alignment score: same X bounds = higher priority
-                x_alignment = 1.0 if (minx_b == minx_a and maxx_b == maxx_a) else 0.5
-                # Store (overlap_area, x_alignment, miny_b - miny_a, other_name)
-                # Priority: max overlap, then same column (x_alignment=1.0), then closer (smaller distance)
-                north_overlaps.append((overlap_area, x_alignment, miny_b - miny_a, other_name))
+                # Calculate alignment: same column = high alignment
+                # For same column, the horizontal overlap should span most of BOTH tiles' widths
+                # OR if overlap spans most of the smaller tile (indicates same column with size mismatch)
+                tile_width_b = maxx_b - minx_b
+                overlap_width_ratio_a = overlap_width / tile_width_a if tile_width_a > 0 else 0.0
+                overlap_width_ratio_b = overlap_width / tile_width_b if tile_width_b > 0 else 0.0
+                # High alignment if:
+                # 1. Both tiles have >80% overlap (perfect alignment)
+                # 2. Exact X bounds match (perfect alignment)
+                # 3. Smaller tile has >80% overlap (indicates same column with size mismatch)
+                max_ratio = max(overlap_width_ratio_a, overlap_width_ratio_b)
+                x_alignment = 1.0 if (overlap_width_ratio_a > 0.8 and overlap_width_ratio_b > 0.8) or (minx_b == minx_a and maxx_b == maxx_a) or (max_ratio > 0.8) else 0.5
+                # Edge alignment: check if X edges align (for same-column detection)
+                # Tiles in same column should have minx or maxx very close (within 0.1m tolerance)
+                edge_tolerance = 0.1
+                left_edge_align = abs(minx_a - minx_b) < edge_tolerance
+                right_edge_align = abs(maxx_a - maxx_b) < edge_tolerance
+                # Higher score if BOTH edges align (perfect same column), medium if one aligns
+                edge_alignment = 2.0 if (left_edge_align and right_edge_align) else (1.0 if (left_edge_align or right_edge_align) else 0.0)
+                # Store (overlap_area, x_alignment, miny_b - miny_a, edge_alignment, other_name)
+                # Priority: alignment (same column), then overlap area, then distance, then edge alignment
+                north_overlaps.append((overlap_area, x_alignment, miny_b - miny_a, edge_alignment, other_name))
         
         # South neighbor: other tile extends below (south) of this tile
         # The overlap should be on the bottom side of this tile
@@ -244,38 +300,55 @@ def find_spatial_neighbors(
         if miny_b < miny_a and maxy_b >= miny_a - tolerance and overlap_height >= tolerance:
             # Check if there's horizontal overlap
             if not (maxx_b < minx_a or minx_b > maxx_a):
-                # Calculate alignment score: same X bounds = higher priority
-                x_alignment = 1.0 if (minx_b == minx_a and maxx_b == maxx_a) else 0.5
-                # Store (overlap_area, x_alignment, miny_a - miny_b, other_name)
-                # Priority: max overlap, then same column (x_alignment=1.0), then closer (smaller distance)
-                south_overlaps.append((overlap_area, x_alignment, miny_a - miny_b, other_name))
+                # Calculate alignment: same column = high alignment
+                # For same column, the horizontal overlap should span most of BOTH tiles' widths
+                # OR if overlap spans most of the smaller tile (indicates same column with size mismatch)
+                tile_width_b = maxx_b - minx_b
+                overlap_width_ratio_a = overlap_width / tile_width_a if tile_width_a > 0 else 0.0
+                overlap_width_ratio_b = overlap_width / tile_width_b if tile_width_b > 0 else 0.0
+                # High alignment if:
+                # 1. Both tiles have >80% overlap (perfect alignment)
+                # 2. Exact X bounds match (perfect alignment)
+                # 3. Smaller tile has >80% overlap (indicates same column with size mismatch)
+                max_ratio = max(overlap_width_ratio_a, overlap_width_ratio_b)
+                x_alignment = 1.0 if (overlap_width_ratio_a > 0.8 and overlap_width_ratio_b > 0.8) or (minx_b == minx_a and maxx_b == maxx_a) or (max_ratio > 0.8) else 0.5
+                # Edge alignment: check if X edges align (for same-column detection)
+                # Tiles in same column should have minx or maxx very close (within 0.1m tolerance)
+                edge_tolerance = 0.1
+                left_edge_align = abs(minx_a - minx_b) < edge_tolerance
+                right_edge_align = abs(maxx_a - maxx_b) < edge_tolerance
+                # Higher score if BOTH edges align (perfect same column), medium if one aligns
+                edge_alignment = 2.0 if (left_edge_align and right_edge_align) else (1.0 if (left_edge_align or right_edge_align) else 0.0)
+                # Store (overlap_area, x_alignment, miny_a - miny_b, edge_alignment, other_name)
+                # Priority: alignment (same column), then overlap area, then distance, then edge alignment
+                south_overlaps.append((overlap_area, x_alignment, miny_a - miny_b, edge_alignment, other_name))
     
-    # Pick the neighbor with the largest overlap for each direction
-    # If overlaps are equal, prefer aligned neighbors (same row/column), then closer ones
+    # Pick the neighbor with the best alignment first, then largest overlap, then closest distance, then best edge alignment
+    # Alignment (same row/column) is prioritized over overlap area to avoid diagonal neighbors
     if east_overlaps:
-        best_east = max(east_overlaps, key=lambda x: (x[0], -x[1]))
-        neighbors["east"] = best_east[2]  # Max overlap, then min distance
+        best_east = max(east_overlaps, key=lambda x: (x[1], x[3], x[0], -x[2]))  # Alignment, edge alignment, overlap, min distance
+        neighbors["east"] = best_east[4]  # other_name is now at index 4
         # Debug logging
         if len(east_overlaps) > 1:
-            print(f"      DEBUG {tile_name} east neighbor: selected {best_east[2]} from {len(east_overlaps)} candidates (overlap: {best_east[0]:.2f} m², distance: {best_east[1]:.2f}m)")
+            print(f"      DEBUG {tile_name} east neighbor: selected {best_east[4]} from {len(east_overlaps)} candidates (overlap: {best_east[0]:.2f} m², alignment: {best_east[1]:.1f}, distance: {best_east[2]:.2f}m)")
     if west_overlaps:
-        best_west = max(west_overlaps, key=lambda x: (x[0], x[1], -x[2]))
-        neighbors["west"] = best_west[3]  # Max overlap, then alignment, then min distance
+        best_west = max(west_overlaps, key=lambda x: (x[1], x[3], x[0], -x[2]))  # Alignment, edge alignment, overlap, min distance
+        neighbors["west"] = best_west[4]  # other_name is now at index 4
         # Debug logging
         if len(west_overlaps) > 1:
-            print(f"      DEBUG {tile_name} west neighbor: selected {best_west[3]} from {len(west_overlaps)} candidates (overlap: {best_west[0]:.2f} m², alignment: {best_west[1]:.1f}, distance: {best_west[2]:.2f}m)")
+            print(f"      DEBUG {tile_name} west neighbor: selected {best_west[4]} from {len(west_overlaps)} candidates (overlap: {best_west[0]:.2f} m², alignment: {best_west[1]:.1f}, distance: {best_west[2]:.2f}m)")
     if north_overlaps:
-        best_north = max(north_overlaps, key=lambda x: (x[0], x[1], -x[2]))
-        neighbors["north"] = best_north[3]  # Max overlap, then alignment, then min distance
+        best_north = max(north_overlaps, key=lambda x: (x[1], x[3], x[0], -x[2]))  # Alignment, edge alignment, overlap, min distance
+        neighbors["north"] = best_north[4]  # other_name is now at index 4
         # Debug logging
         if len(north_overlaps) > 1:
-            print(f"      DEBUG {tile_name} north neighbor: selected {best_north[3]} from {len(north_overlaps)} candidates (overlap: {best_north[0]:.2f} m², alignment: {best_north[1]:.1f}, distance: {best_north[2]:.2f}m)")
+            print(f"      DEBUG {tile_name} north neighbor: selected {best_north[4]} from {len(north_overlaps)} candidates (overlap: {best_north[0]:.2f} m², alignment: {best_north[1]:.1f}, distance: {best_north[2]:.2f}m)")
     if south_overlaps:
-        best_south = max(south_overlaps, key=lambda x: (x[0], x[1], -x[2]))
-        neighbors["south"] = best_south[3]  # Max overlap, then alignment, then min distance
+        best_south = max(south_overlaps, key=lambda x: (x[1], x[3], x[0], -x[2]))  # Alignment, edge alignment, overlap, min distance
+        neighbors["south"] = best_south[4]  # other_name is now at index 4
         # Debug logging
         if len(south_overlaps) > 1:
-            print(f"      DEBUG {tile_name} south neighbor: selected {best_south[3]} from {len(south_overlaps)} candidates (overlap: {best_south[0]:.2f} m², alignment: {best_south[1]:.1f}, distance: {best_south[2]:.2f}m)")
+            print(f"      DEBUG {tile_name} south neighbor: selected {best_south[4]} from {len(south_overlaps)} candidates (overlap: {best_south[0]:.2f} m², alignment: {best_south[1]:.1f}, distance: {best_south[2]:.2f}m)")
     
     return neighbors
 

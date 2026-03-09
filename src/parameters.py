@@ -177,7 +177,6 @@ class Parameters(BaseSettings):
         validation_alias=AliasChoices("target-folder", "target_folder"),
     )
 
-
     # Merge algorithm parameters
     buffer: Optional[float] = Field(
         10.0,

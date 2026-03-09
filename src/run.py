@@ -206,15 +206,12 @@ def run_remap_task(params: Parameters):
     else:
         output_folder = Path(output_folder)
 
-    tolerance = params.tolerance if params.tolerance else 5.0
-
     print("=" * 60)
     print("Running Remap Task")
     print("=" * 60)
     print(f"Source folder: {source_folder}")
     print(f"Target folder: {target_folder}")
     print(f"Output folder: {output_folder}")
-    print(f"Tolerance: {tolerance}m")
     print()
 
     try:
@@ -353,7 +350,12 @@ def run_merge_task(params: Parameters):
         # Auto-derive paths if not provided
         parent_dir = segmented_remapped_folder.parent
         if output_tiles_dir is None:
-            output_tiles_dir = parent_dir / "output_tiles"
+            # Use segmented folder's parent, but ensure it's writable
+            # If parent is root or not writable, use segmented folder itself
+            if parent_dir == Path('/') or not os.access(parent_dir, os.W_OK):
+                output_tiles_dir = segmented_remapped_folder / "output_tiles"
+            else:
+                output_tiles_dir = parent_dir / "output_tiles"
         if original_tiles_dir is None:
             # Try to find the tiles directory (parent of subsampled folders)
             original_tiles_dir = parent_dir
