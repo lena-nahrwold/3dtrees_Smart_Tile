@@ -222,8 +222,7 @@ def run_remap_task(params: Parameters):
         remapped_folder = remap_all_tiles(
             source_folder=source_folder,
             target_folder=target_folder,
-            output_folder=output_folder,
-            tolerance=tolerance
+            output_folder=output_folder
         )
 
         print()
@@ -319,13 +318,10 @@ def run_merge_task(params: Parameters):
                 sys.exit(1)
             
             # Remap - source is 10cm segmented, target is 2cm subsampled
-            # Use higher tolerance for matching original files to tiled outputs
-            remap_tolerance = params.tolerance if params.tolerance else 50.0  # Increased default for tile matching
             segmented_remapped_folder = remap_all_tiles(
                 source_folder=subsampled_10cm_dir,
                 target_folder=target_folder,
-                output_folder=output_folder,
-                tolerance=remap_tolerance
+                output_folder=output_folder
             )
         
         # Step 2: Merge tiles
@@ -482,8 +478,7 @@ def run_remap_merge_task(params: Parameters):
         remapped_folder = remap_all_tiles(
             source_folder=source_folder,
             target_folder=target_folder,
-            output_folder=output_folder,
-            tolerance=tolerance
+            output_folder=output_folder
         )
 
         print()
