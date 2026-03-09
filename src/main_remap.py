@@ -42,18 +42,62 @@ def get_file_bounds(filepath: Path) -> Optional[Tuple[float, float, float, float
         return None
 
 
-def bounds_match(
+def calculate_bounds_overlap(
     bounds1: Tuple[float, float, float, float],
-    bounds2: Tuple[float, float, float, float],
-    tolerance: float = 5.0
-) -> bool:
+    bounds2: Tuple[float, float, float, float]
+) -> float:
     """
-    Check if two bounds match within tolerance.
+    Calculate IoU (Intersection over Union) between two bounding boxes.
     
     Args:
         bounds1: Tuple of (minx, maxx, miny, maxy) for first file
         bounds2: Tuple of (minx, maxx, miny, maxy) for second file
-        tolerance: Maximum difference in meters for each bound component
+    
+    Returns:
+        IoU percentage (0-100), or 0.0 if no overlap
+    """
+    if bounds1 is None or bounds2 is None:
+        return 0.0
+    
+    minx1, maxx1, miny1, maxy1 = bounds1
+    minx2, maxx2, miny2, maxy2 = bounds2
+    
+    # Calculate intersection
+    overlap_minx = max(minx1, minx2)
+    overlap_maxx = min(maxx1, maxx2)
+    overlap_miny = max(miny1, miny2)
+    overlap_maxy = min(maxy1, maxy2)
+    
+    # No overlap
+    if overlap_maxx <= overlap_minx or overlap_maxy <= overlap_miny:
+        return 0.0
+    
+    # Calculate intersection area
+    intersection = (overlap_maxx - overlap_minx) * (overlap_maxy - overlap_miny)
+    
+    # Calculate union area
+    area1 = (maxx1 - minx1) * (maxy1 - miny1)
+    area2 = (maxx2 - minx2) * (maxy2 - miny2)
+    union = area1 + area2 - intersection
+    
+    # Calculate IoU as percentage
+    iou = (intersection / union) * 100 if union > 0 else 0.0
+    
+    return iou
+
+
+def bounds_match_tolerance(
+    bounds1: Tuple[float, float, float, float],
+    bounds2: Tuple[float, float, float, float],
+    tolerance: float = 1.0
+) -> bool:
+    """
+    Check if two bounds match within strict tolerance.
+    
+    Args:
+        bounds1: Tuple of (minx, maxx, miny, maxy) for first file
+        bounds2: Tuple of (minx, maxx, miny, maxy) for second file
+        tolerance: Maximum difference in meters for each bound component (default: 1.0)
     
     Returns:
         True if all bound components match within tolerance
@@ -68,6 +112,32 @@ def bounds_match(
             abs(maxx1 - maxx2) <= tolerance and
             abs(miny1 - miny2) <= tolerance and
             abs(maxy1 - maxy2) <= tolerance)
+
+
+def bounds_match(
+    bounds1: Tuple[float, float, float, float],
+    bounds2: Tuple[float, float, float, float]
+) -> bool:
+    """
+    Check if two bounds match using two-stage approach.
+    
+    Stage 1: Try strict tolerance matching (1m)
+    Stage 2: Fallback to IoU matching (30% threshold)
+    
+    Args:
+        bounds1: Tuple of (minx, maxx, miny, maxy) for first file
+        bounds2: Tuple of (minx, maxx, miny, maxy) for second file
+    
+    Returns:
+        True if bounds match by either method
+    """
+    # Stage 1: Try strict tolerance matching (1m)
+    if bounds_match_tolerance(bounds1, bounds2, tolerance=1.0):
+        return True
+    
+    # Stage 2: Fallback to IoU matching (30%)
+    iou = calculate_bounds_overlap(bounds1, bounds2)
+    return iou >= 30.0
 
 
 def remap_single_tile(
@@ -186,21 +256,24 @@ def remap_single_tile(
 
 def find_matching_files(
     source_folder: Path,
-    target_folder: Path,
-    tolerance: float = 5.0
+    target_folder: Path
 ) -> List[Tuple[Path, Path, str]]:
     """
-    Find matching files between source and target folders by comparing spatial bounds.
+    Find matching files between source and target folders using two-stage matching.
+    
+    Stage 1: Strict tolerance matching (1m)
+    Stage 2: IoU-based matching (30% threshold)
     
     Args:
         source_folder: Directory containing source LAZ files (e.g., segmented files)
         target_folder: Directory containing target LAZ files (e.g., 2cm subsampled files)
-        tolerance: Maximum difference in meters for bounds matching (default: 5.0)
     
     Returns:
         List of (source_file, target_file, tile_id) tuples
     """
     matches = []
+    tolerance_matches = 0
+    iou_matches = 0
     
     # Get all LAZ files from both folders (flat structure)
     source_files = sorted(source_folder.glob("*.laz"))
@@ -230,20 +303,35 @@ def find_matching_files(
             print(f"  Warning: Could not extract bounds from {source_file.name}")
             continue
         
-        # Find matching target file(s)
-        matched_targets = []
+        # Find matching target file(s) and track match method + IoU
+        matched_targets = []  # List of (target_file, match_method, iou)
         for target_file, target_bounds in target_bounds_map.items():
-            if bounds_match(source_bounds, target_bounds, tolerance):
-                matched_targets.append(target_file)
+            # Check strict tolerance first
+            if bounds_match_tolerance(source_bounds, target_bounds, tolerance=1.0):
+                iou = calculate_bounds_overlap(source_bounds, target_bounds)
+                matched_targets.append((target_file, "tolerance", iou))
+            else:
+                # Try IoU matching
+                iou = calculate_bounds_overlap(source_bounds, target_bounds)
+                if iou >= 30.0:
+                    matched_targets.append((target_file, "iou", iou))
         
         if len(matched_targets) == 0:
             print(f"  Warning: No matching target file found for {source_file.name}")
             continue
         elif len(matched_targets) > 1:
-            print(f"  Warning: Multiple target files match {source_file.name}, using first match")
+            # Select best match by highest IoU
+            matched_targets.sort(key=lambda x: x[2], reverse=True)
+            print(f"  Info: Multiple matches for {source_file.name}, selecting best by IoU")
         
-        # Use first match
-        target_file = matched_targets[0]
+        # Use best match
+        target_file, match_method, best_iou = matched_targets[0]
+        
+        # Track match method statistics
+        if match_method == "tolerance":
+            tolerance_matches += 1
+        else:
+            iou_matches += 1
         
         # Extract tile_id from filename if possible, otherwise use stem
         tile_id_match = re.search(r'(c\d+_r\d+)', source_file.stem)
@@ -256,25 +344,28 @@ def find_matching_files(
         matches.append((source_file, target_file, tile_id))
         print(f"  Matched: {source_file.name} <-> {target_file.name}")
     
+    # Print matching statistics
+    print(f"  Matching summary: {tolerance_matches} by tolerance (1m), {iou_matches} by IoU (30%)")
+    
     return matches
 
 
 def remap_all_tiles(
     source_folder: Path,
     target_folder: Path,
-    output_folder: Path,
-    tolerance: float = 5.0
+    output_folder: Path
 ) -> Path:
     """
     Remap predictions from source files to target files for all tiles.
     
-    Matches files between source and target folders by comparing spatial bounds.
+    Uses two-stage matching approach:
+    - Stage 1: Strict tolerance matching (1m)
+    - Stage 2: IoU-based matching (30% threshold)
     
     Args:
         source_folder: Path to folder containing source LAZ files (e.g., segmented files)
         target_folder: Path to folder containing target LAZ files (e.g., 2cm subsampled files)
         output_folder: Output folder for remapped files
-        tolerance: Maximum difference in meters for bounds matching (default: 5.0)
     
     Returns:
         Path to output folder
@@ -285,7 +376,7 @@ def remap_all_tiles(
     print(f"Source folder: {source_folder}")
     print(f"Target folder: {target_folder}")
     print(f"Output folder: {output_folder}")
-    print(f"Bounds tolerance: {tolerance}m")
+    print(f"Matching: Two-stage (1m tolerance → 30% IoU)")
     print()
     
     # Validate directories exist
@@ -300,10 +391,10 @@ def remap_all_tiles(
     
     # Find matching files by bounds
     print("Matching files by spatial bounds...")
-    matches = find_matching_files(source_folder, target_folder, tolerance)
+    matches = find_matching_files(source_folder, target_folder)
     
     if not matches:
-        raise ValueError(f"No matching source/target file pairs found (tolerance: {tolerance}m)")
+        raise ValueError(f"No matching source/target file pairs found")
     
     print(f"Found {len(matches)} matching file pairs")
     print()
@@ -397,13 +488,6 @@ Examples:
         help="Output folder for remapped files"
     )
     
-    parser.add_argument(
-        "--tolerance",
-        type=float,
-        default=5.0,
-        help="Maximum difference in meters for bounds matching (default: 5.0)"
-    )
-    
     args = parser.parse_args()
     
     # Run pipeline
@@ -411,8 +495,7 @@ Examples:
         output_folder = remap_all_tiles(
             source_folder=args.source_folder,
             target_folder=args.target_folder,
-            output_folder=args.output_folder,
-            tolerance=args.tolerance
+            output_folder=args.output_folder
         )
         print(f"\nRemapped files ready: {output_folder}")
     except Exception as e:
