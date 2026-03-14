@@ -2327,16 +2327,16 @@ def add_original_dimensions_to_merged(
             extra_params.append(laspy.ExtraBytesParams(name=out_name, type=dtype))
     if extra_params:
         merged.add_extra_dims(extra_params)
-    # Overwrite: use original-file values (ground truth); cast to merged's dtype for packed subfields.
-    # New dims: pass float64 as-is.
+    # Set all dimensions; cast to merged point record dtype to avoid laspy left_shift TypeError.
     for name, arr in new_arrays.items():
-        if name in dims_to_overwrite:
-            target_view = getattr(merged, name, None)
-            if target_view is not None and hasattr(target_view, "dtype"):
-                arr = np.asarray(arr, dtype=np.asarray(target_view).dtype)
-            setattr(merged, name, arr)
-        else:
-            setattr(merged, name, arr)
+        arr = np.asarray(arr)
+        try:
+            target_dtype = getattr(merged.points, name).dtype
+            if arr.dtype != target_dtype:
+                arr = arr.astype(target_dtype)
+        except (AttributeError, KeyError, TypeError):
+            pass
+        setattr(merged, name, arr)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     merged.write(str(output_path), do_compress=True, laz_backend=laspy.LazBackend.LazrsParallel)
