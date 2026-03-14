@@ -1,54 +1,27 @@
 # =============================================================================
 # 3DTrees Smart Tile Pipeline - Dockerfile
 # =============================================================================
-# Single-stage build with all dependencies
-# Builds pdal_wrench from source (requires PDAL >= 2.5, GDAL >= 3.0)
+# Single-stage build. Pipeline uses laspy + PDAL only (no untwine).
 # =============================================================================
 
 FROM condaforge/miniforge3:latest
 
-# Install system dependencies using mamba (PDAL, GDAL, build tools)
-# PDAL: Required for pdal and for building untwine (used in main_tile.py, main_subsample.py)
-# untwine: Built from source below (>=1.4) for --dims fix; conda-forge only has 1.3.2
-# gdal: Required for fiona (used in get_bounds_from_tindex.py, plot_tiles_and_copc.py)
-# cmake, make, cxx-compiler, git: Required for building untwine from source
+# System deps: PDAL (subprocess), GDAL (required by fiona for reading tindex GeoPackage/shapefile)
 RUN mamba install -n base -c conda-forge \
     python=3.10 \
     pdal \
     gdal \
-    cmake \
-    make \
-    cxx-compiler \
-    git \
     -y && \
     mamba clean --all -y
 
-# Build untwine from source (>=1.4) for fix hobuinc/untwine#151 (--dims X,Y,Z crash)
-# Conda-forge only ships 1.3.2; 1.4+ fixes "free(): invalid pointer" / segfault with --dims
-ARG UNTWINE_VERSION=1.5.1
-RUN git clone --depth 1 --branch ${UNTWINE_VERSION} https://github.com/hobuinc/untwine.git /tmp/untwine && \
-    cd /tmp/untwine && \
-    mkdir build && cd build && \
-    cmake -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/opt/conda .. && \
-    make -j$(nproc) && \
-    make install && \
-    cd / && rm -rf /tmp/untwine
-
-# Install uv
+# Install uv for fast pip installs
 RUN pip install --no-cache-dir uv
 
-# Install Python dependencies using uv
-# lazrs: LAZ compression backend for laspy (laspy.LazBackend.Lazrs / LazrsParallel)
-# laspy: Used extensively for reading/writing LAZ/LAS files; pass laz_backend=... when reading/writing LAZ
-# numpy: Used extensively for array operations
-# scipy: Used for cKDTree in merge_tiles.py and main_remap.py
-# matplotlib: Used only in plot_tiles_and_copc.py (visualization) - PyPI name is 'matplotlib', not 'matplotlib-base'
-# fiona: Used in get_bounds_from_tindex.py and plot_tiles_and_copc.py for reading shapefiles
-# pyproj: Used in get_bounds_from_tindex.py, prepare_tile_jobs.py, plot_tiles_and_copc.py for CRS transformations
-# pydantic, pydantic-settings: Used in parameters.py for configuration
-# Note: geopandas removed - not used anywhere
-# Note: python-pdal removed - PDAL is only called via subprocess, not imported
-# Note: untwine is built from source above (1.4+), not from conda-forge
+# Python deps (all used):
+# laspy, lazrs – LAZ/LAS read/write (main_tile, main_subsample, merge_tiles, main_remap, filter_buffer_instances)
+# numpy, scipy – arrays and cKDTree (merge_tiles, main_remap)
+# matplotlib, fiona, pyproj – plot_tiles_and_copc.py, get_bounds_from_tindex.py, prepare_tile_jobs.py
+# pydantic, pydantic-settings – parameters.py
 RUN uv pip install --system \
     laspy \
     lazrs \
@@ -60,9 +33,8 @@ RUN uv pip install --system \
     pydantic \
     pydantic-settings
 
-# Verify installations
-RUN pdal --version && \
-    untwine --version
+# Verify PDAL
+RUN pdal --version
 
 # ===========================================
 # Setup project
