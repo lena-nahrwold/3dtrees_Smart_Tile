@@ -71,6 +71,26 @@ def extra_bytes_params_from_dimension_info(
     )
 
 
+def _next_available_suffix(base: str, used: set) -> str:
+    """Return base_1, base_2, ... first not in used. Used to avoid losing dimensions on name collision."""
+    for i in range(1, 10000):
+        cand = f"{base}_{i}"
+        if cand not in used:
+            return cand
+    return f"{base}_9999"
+
+
+def _suffixes_for_collision(base: str, used: set) -> tuple[str, str]:
+    """Return (name_1, name_2) for original vs merged, per dimension. Suffix is 1/2 per base name, not global."""
+    cand_1 = f"{base}_1"
+    cand_2 = f"{base}_2"
+    out_1 = cand_1 if cand_1 not in used else _next_available_suffix(base, used)
+    used.add(out_1)
+    out_2 = cand_2 if cand_2 not in used else _next_available_suffix(base, used)
+    used.add(out_2)
+    return (out_1, out_2)
+
+
 # =============================================================================
 # Union-Find Data Structure
 # =============================================================================
@@ -1536,42 +1556,68 @@ def _process_single_tile(args):
         output_las = laspy.LasData(new_header)
         
         # Collect all extra dims to add in one batch (avoids repeated data copies)
+        orig_standard_names = set(orig_las.point_format.dimension_names)
         orig_extra_dim_names = {dim.name for dim in orig_las.point_format.extra_dimensions}
-        output_extra_dim_names = {dim.name for dim in output_las.point_format.extra_dimensions}
+        orig_dim_names = orig_standard_names | orig_extra_dim_names
+        merged_dim_names = {instance_dimension} | set(new_extras.keys())
+        collision = orig_dim_names & merged_dim_names
         
+        # When a dimension exists in both original and merged, rename to base_1 (original) and base_2 (merged)
+        # Per dimension: use _1 and _2 for this base name only, so we get PredInstance_1/2, PredSemantic_1/2, not global _3/_4
+        used_names = set(orig_dim_names)
+        orig_rename = {}
+        merged_rename = {}
+        for name in sorted(collision):
+            o1, o2 = _suffixes_for_collision(name, used_names)
+            orig_rename[name] = o1
+            merged_rename[name] = o2
+        
+        output_extra_dim_names = {dim.name for dim in output_las.point_format.extra_dimensions}
         extra_dims_to_add = []
         for dim in orig_las.point_format.extra_dimensions:
-            if dim.name not in output_extra_dim_names:
-                extra_dims_to_add.append(extra_bytes_params_from_dimension_info(dim))
-                output_extra_dim_names.add(dim.name)
+            out_name = orig_rename.get(dim.name, dim.name)
+            if out_name not in output_extra_dim_names:
+                extra_dims_to_add.append(extra_bytes_params_from_dimension_info(dim, name=out_name))
+                output_extra_dim_names.add(out_name)
         
-        if instance_dimension not in output_extra_dim_names:
-            extra_dims_to_add.append(laspy.ExtraBytesParams(name=instance_dimension, type=np.int32))
-            output_extra_dim_names.add(instance_dimension)
+        inst_out_name = merged_rename.get(instance_dimension, instance_dimension)
+        if inst_out_name not in output_extra_dim_names:
+            extra_dims_to_add.append(laspy.ExtraBytesParams(name=inst_out_name, type=np.int32))
+            output_extra_dim_names.add(inst_out_name)
         
         for dim_name, values in new_extras.items():
-            if dim_name not in output_extra_dim_names:
+            out_name = merged_rename.get(dim_name, dim_name)
+            if out_name not in output_extra_dim_names:
                 if merged_extra_dim_params and dim_name in merged_extra_dim_params:
-                    extra_dims_to_add.append(merged_extra_dim_params[dim_name])
+                    params = merged_extra_dim_params[dim_name]
+                    extra_dims_to_add.append(laspy.ExtraBytesParams(name=out_name, type=params.type))
                 else:
-                    extra_dims_to_add.append(laspy.ExtraBytesParams(name=dim_name, type=values.dtype))
-                output_extra_dim_names.add(dim_name)
+                    extra_dims_to_add.append(laspy.ExtraBytesParams(name=out_name, type=values.dtype))
+                output_extra_dim_names.add(out_name)
         
         if extra_dims_to_add:
             output_las.add_extra_dims(extra_dims_to_add)
         
-        # Copy original dimensions
+        # Copy original dimensions (standard + extra) so we preserve full precision
         for dim_name in orig_las.point_format.dimension_names:
             try:
                 if hasattr(orig_las, dim_name):
                     setattr(output_las, dim_name, getattr(orig_las, dim_name))
             except Exception:
                 pass
+        for dim in orig_las.point_format.extra_dimensions:
+            name = dim.name
+            out_name = orig_rename.get(name, name)
+            if hasattr(orig_las, name):
+                try:
+                    setattr(output_las, out_name, getattr(orig_las, name))
+                except Exception:
+                    pass
         
-        # Write instance dimension and merged extra dims
-        setattr(output_las, instance_dimension, new_instances)
+        # Write merged dimensions (under original name or renamed to base_2 when collision)
+        setattr(output_las, merged_rename.get(instance_dimension, instance_dimension), new_instances)
         for dim_name, values in new_extras.items():
-            setattr(output_las, dim_name, values)
+            setattr(output_las, merged_rename.get(dim_name, dim_name), values)
 
         output_las.write(
             str(output_file),
@@ -1709,17 +1755,20 @@ def retile_to_original_files(
 def _process_single_original_input_file(args):
     """
     Process a single original input LAZ file for remapping. Designed to be called in parallel.
-    Transfers all dimensions from merged (by nearest-neighbor) to the original points.
+    Transfers only 3DTrees-specific dimensions from merged (by nearest-neighbor) to the original points,
+    renaming them to 3DT_{name}_{suffix} format (e.g. 3DT_PredInstance_SAT).
 
     Args:
         args: Tuple of (input_file, output_file, merged_points, merged_extra_dims,
-              tolerance, spatial_buffer, kdtree_workers)
+              merged_extra_dim_params, tolerance, spatial_buffer, kdtree_workers,
+              threedtrees_dims, threedtrees_suffix)
 
     Returns:
         Tuple of (filename, matched_count, total_count, unique_instances, success, message)
     """
     (input_file, output_file, merged_points, merged_extra_dims,
-     merged_extra_dim_params, tolerance, spatial_buffer, kdtree_workers) = args
+     merged_extra_dim_params, tolerance, spatial_buffer, kdtree_workers,
+     threedtrees_dims, threedtrees_suffix) = args
     
     try:
         with laspy.open(
@@ -1753,44 +1802,31 @@ def _process_single_original_input_file(args):
 
         distances, indices = local_tree.query(input_points, workers=kdtree_workers)
 
-        new_extras = {name: arr[indices] for name, arr in local_merged_extras.items()}
+        # Filter merged dims to only 3DTrees-specific dimensions
+        if threedtrees_dims:
+            filtered_extras = {name: arr[indices] for name, arr in local_merged_extras.items()
+                               if name in threedtrees_dims}
+        else:
+            # No filtering — transfer all (fallback, should not normally happen)
+            filtered_extras = {name: arr[indices] for name, arr in local_merged_extras.items()}
 
         matched_count = n_input_points
         # Heuristic: count unique non-zero values from first int-like dimension for reporting
         unique_instances = 0
-        for arr in new_extras.values():
+        for arr in filtered_extras.values():
             if np.issubdtype(arr.dtype, np.integer) and len(arr) > 0:
                 unique_instances = max(unique_instances, len(np.unique(arr[arr > 0])))
                 break
 
-        # Reuse shared logic: which original dimensions are empty/constant and should be replaced from merged
-        merged_dtypes = {name: arr.dtype for name, arr in local_merged_extras.items()}
-        target_dim_names = set(input_las.point_format.dimension_names) | {
-            d.name for d in input_las.point_format.extra_dimensions
-        }
-        _, dims_to_overwrite = _dims_to_fill_from_source(
-            merged_dtypes, target_dim_names, lambda n: getattr(input_las, n, None)
-        )
-        # If merged range does not contain original range for a dimension, keep original (avoid rounding/loss)
-        for dim_name in list(dims_to_overwrite.keys()):
-            if dim_name not in new_extras:
-                continue
-            orig_arr = getattr(input_las, dim_name, None)
-            if orig_arr is None:
-                continue
-            orig_arr = np.asarray(orig_arr)
-            merged_arr = new_extras[dim_name]
-            omin, omax = float(np.min(orig_arr)), float(np.max(orig_arr))
-            mmin, mmax = float(np.min(merged_arr)), float(np.max(merged_arr))
-            if orig_arr.dtype.kind in "iu" and merged_arr.dtype.kind in "iu":
-                tol = 0
+        # Build branded output names: 3DT_{name}_{suffix} (e.g. 3DT_PredInstance_SAT)
+        branded_names = {}
+        for dim_name in filtered_extras:
+            if threedtrees_suffix:
+                branded_names[dim_name] = f"3DT_{dim_name}_{threedtrees_suffix}"
             else:
-                tol = 1e-6 * (omax - omin + 1e-12)
-            if (omin < mmin - tol or omax > mmax + tol) or (np.isfinite(omin) and not np.isfinite(mmin)):
-                dims_to_overwrite.pop(dim_name, None)
+                branded_names[dim_name] = f"3DT_{dim_name}"
 
-        # Use standard point format (by id) so output keeps "original structure";
-        # all merge-derived and any non-standard dims are added as extra dimensions only.
+        # Use original file's point format so output preserves original structure
         fmt_id = getattr(input_las.header.point_format, "id", input_las.header.point_format)
         if hasattr(fmt_id, "id"):
             fmt_id = fmt_id.id
@@ -1803,64 +1839,51 @@ def _process_single_original_input_file(args):
 
         output_las = laspy.LasData(new_header)
         output_standard_dim_names = set(output_las.point_format.dimension_names)
-        output_extra_dim_names = {dim.name for dim in output_las.point_format.extra_dimensions}
-
-        def _dtype_for_dim(name, from_extra_dim=None, from_array=None):
-            if from_extra_dim is not None:
-                return from_extra_dim.dtype
-            if from_array is not None:
-                return from_array.dtype
-            arr = getattr(input_las, name, None)
-            return arr.dtype if arr is not None else np.int32
 
         extra_dims_to_add = []
-        # Original extra dimensions -> add as extra
+        added_extra_names = set(output_standard_dim_names)  # start with standard names to avoid duplicates
+        # Original extra dimensions — keep as-is (skip if name clashes with standard dims)
         for dim in input_las.point_format.extra_dimensions:
-            if dim.name not in output_standard_dim_names and dim.name not in output_extra_dim_names:
+            if dim.name not in added_extra_names:
                 extra_dims_to_add.append(extra_bytes_params_from_dimension_info(dim))
-                output_extra_dim_names.add(dim.name)
-        # Original "standard" dims that are not in the chosen standard format (custom format) -> add as extra
+                added_extra_names.add(dim.name)
+        # Original "standard" dims not in the chosen standard format → add as extra
         for dim_name in input_las.point_format.dimension_names:
-            if dim_name not in output_standard_dim_names and dim_name not in output_extra_dim_names:
-                dtype = _dtype_for_dim(dim_name)
+            if dim_name not in added_extra_names:
+                arr = getattr(input_las, dim_name, None)
+                dtype = arr.dtype if arr is not None else np.int32
                 extra_dims_to_add.append(laspy.ExtraBytesParams(name=dim_name, type=dtype))
-                output_extra_dim_names.add(dim_name)
-        # Merge-derived dimensions -> always as extra
-        for dim_name, values in new_extras.items():
-            if dim_name not in output_standard_dim_names and dim_name not in output_extra_dim_names:
+                added_extra_names.add(dim_name)
+        # 3DTrees branded dimensions from merged file
+        for dim_name, values in filtered_extras.items():
+            out_name = branded_names[dim_name]
+            if out_name not in added_extra_names:
                 if merged_extra_dim_params and dim_name in merged_extra_dim_params:
-                    extra_dims_to_add.append(merged_extra_dim_params[dim_name])
+                    params = merged_extra_dim_params[dim_name]
+                    extra_dims_to_add.append(laspy.ExtraBytesParams(name=out_name, type=params.type))
                 else:
-                    extra_dims_to_add.append(laspy.ExtraBytesParams(name=dim_name, type=values.dtype))
-                output_extra_dim_names.add(dim_name)
+                    extra_dims_to_add.append(laspy.ExtraBytesParams(name=out_name, type=values.dtype))
+                added_extra_names.add(out_name)
 
         if extra_dims_to_add:
             output_las.add_extra_dims(extra_dims_to_add)
 
-        # Copy standard dimensions from original (or merged where we overwrite); keep original array/dtype to avoid rounding
+        # Copy all original dimensions (standard + extra) as-is
         for dim_name in output_las.point_format.dimension_names:
             try:
-                if not hasattr(input_las, dim_name):
-                    continue
-                if dim_name in dims_to_overwrite and dim_name in new_extras:
-                    setattr(output_las, dim_name, new_extras[dim_name])
-                else:
+                if hasattr(input_las, dim_name):
                     setattr(output_las, dim_name, getattr(input_las, dim_name))
             except Exception:
                 pass
-        # Copy extra dimensions (original + merge-derived): from original or from merged
-        for dim in output_las.point_format.extra_dimensions:
-            name = dim.name
-            if name in dims_to_overwrite and name in new_extras:
-                setattr(output_las, name, new_extras[name])
-            else:
-                orig_vals = getattr(input_las, name, None)
-                if orig_vals is not None:
-                    setattr(output_las, name, orig_vals)
-                elif name in new_extras:
-                    setattr(output_las, name, new_extras[name])
-                else:
-                    setattr(output_las, name, np.zeros(n_input_points, dtype=dim.dtype))
+        for dim in input_las.point_format.extra_dimensions:
+            if hasattr(input_las, dim.name):
+                try:
+                    setattr(output_las, dim.name, getattr(input_las, dim.name))
+                except Exception:
+                    pass
+        # Write 3DTrees branded dimensions
+        for dim_name, values in filtered_extras.items():
+            setattr(output_las, branded_names[dim_name], values)
 
         output_file.parent.mkdir(parents=True, exist_ok=True)
         output_las.write(
@@ -1868,7 +1891,7 @@ def _process_single_original_input_file(args):
             do_compress=True,
             laz_backend=laspy.LazBackend.LazrsParallel,
         )
-        
+
         del input_las
         del output_las
 
@@ -1928,11 +1951,12 @@ def remap_to_original_input_files(
     tolerance: float = 0.1,
     num_threads: int = 8,
     retile_buffer: float = 2.0,
+    threedtrees_dims: Optional[List[str]] = None,
+    threedtrees_suffix: str = "SAT",
 ):
     """
-    Transfer all merged dimensions to original input LAZ files (pre-tiling) by nearest-neighbor.
-    No instance dimension is required: every extra dimension in the merged file is copied to
-    each original point from its nearest merged point.
+    Transfer 3DTrees dimensions from merged to original input LAZ files by nearest-neighbor.
+    Only dimensions listed in threedtrees_dims are transferred, renamed to 3DT_{name}_{suffix}.
 
     Args:
         merged_points: Merged point cloud coordinates (N, 3)
@@ -1942,6 +1966,8 @@ def remap_to_original_input_files(
         tolerance: Distance tolerance for point matching (used for spatial buffer calculation)
         num_threads: Number of threads for KDTree queries (default: 8)
         retile_buffer: Additional spatial buffer in meters (fixed: 2.0m)
+        threedtrees_dims: List of dimension names to transfer (default: ["PredInstance", "PredSemantic"])
+        threedtrees_suffix: Suffix for branding (e.g. "SAT" → 3DT_PredInstance_SAT)
     """
     from concurrent.futures import ThreadPoolExecutor
     
@@ -1991,9 +2017,23 @@ def remap_to_original_input_files(
 
     kdtree_workers = -1
     
+    # Default threedtrees_dims if not provided
+    if threedtrees_dims is None:
+        threedtrees_dims = ["PredInstance", "PredSemantic"]
+    threedtrees_dims_set = set(threedtrees_dims)
+
+    # Log which dims will be transferred
+    available_3dt = sorted(threedtrees_dims_set & set(merged_extra_dims.keys()))
+    if available_3dt:
+        branded = [f"3DT_{d}_{threedtrees_suffix}" if threedtrees_suffix else f"3DT_{d}" for d in available_3dt]
+        print(f"  3DTrees dimensions to transfer: {', '.join(available_3dt)} → {', '.join(branded)}", flush=True)
+    else:
+        print(f"  Warning: No 3DTrees dimensions found in merged file (looked for: {', '.join(sorted(threedtrees_dims_set))})", flush=True)
+
     process_args = [
         (input_file, output_file, merged_points, merged_extra_dims,
-         merged_extra_dim_params, tolerance, spatial_buffer, kdtree_workers)
+         merged_extra_dim_params, tolerance, spatial_buffer, kdtree_workers,
+         threedtrees_dims_set, threedtrees_suffix)
         for input_file, output_file in files_to_process
     ]
 
@@ -2159,7 +2199,21 @@ def add_original_dimensions_to_merged(
     dims_to_add_new, dims_to_overwrite = _dims_to_fill_from_source(
         orig_dims, merged_dim_names, lambda n: getattr(merged, n, None), skip=skip_core
     )
-    dims_to_add = {**dims_to_add_new, **dims_to_overwrite}
+    # When a dimension exists in both merged and originals and we're not overwriting (merged has real data),
+    # add the original dimension under a new name (base_1) so we don't lose it. Per dimension: use _1.
+    used_names = set(merged_dim_names) | set(dims_to_add_new.keys()) | set(dims_to_overwrite.keys())
+    collision = (set(orig_dims.keys()) & merged_dim_names) - set(dims_to_overwrite.keys()) - skip_core
+    orig_rename_for_merged: Dict[str, str] = {}
+    for name in sorted(collision):
+        cand = f"{name}_1"
+        out_name = cand if cand not in used_names else _next_available_suffix(name, used_names)
+        orig_rename_for_merged[name] = out_name
+        used_names.add(out_name)
+    dims_to_add_renamed = {orig_rename_for_merged[n]: orig_dims[n] for n in collision}
+    dims_to_add = {**dims_to_add_new, **dims_to_overwrite, **dims_to_add_renamed}
+    # Map each output dimension name -> original dimension name to read from originals
+    orig_dim_to_read = {k: k for k in dims_to_add_new} | {k: k for k in dims_to_overwrite}
+    orig_dim_to_read.update({out_name: name for name, out_name in orig_rename_for_merged.items()})
 
     if not dims_to_add:
         print("  No dimensions to add or replace from originals; writing copy of merged file.", flush=True)
@@ -2172,6 +2226,8 @@ def add_original_dimensions_to_merged(
         print(f"  Adding dimension: {dim_name}", flush=True)
     for dim_name in sorted(dims_to_overwrite.keys()):
         print(f"  Replacing dimension (was empty/constant): {dim_name}", flush=True)
+    for orig_name, out_name in sorted(orig_rename_for_merged.items()):
+        print(f"  Adding dimension from originals (collision with merged): {orig_name} -> {out_name}", flush=True)
 
     spatial_buffer = max(tolerance * 2, 1.0) + retile_buffer
     max_dist = distance_threshold if distance_threshold is not None else spatial_buffer
@@ -2210,10 +2266,10 @@ def add_original_dimensions_to_merged(
             distances = distances[:, 0]
             orig_idx = orig_idx[:, 0]
         orig_dim_arrays = {}
-        for dim_name in dims_to_add:
-            arr = getattr(orig_las, dim_name, None)
+        for out_name, orig_name in orig_dim_to_read.items():
+            arr = getattr(orig_las, orig_name, None)
             if arr is not None:
-                orig_dim_arrays[dim_name] = np.asarray(arr)
+                orig_dim_arrays[out_name] = np.asarray(arr)
         del orig_las
         return (merged_idx, distances, orig_idx, orig_dim_arrays)
 
@@ -2251,20 +2307,34 @@ def add_original_dimensions_to_merged(
             print(f"  {name}: min={vmin}, max={vmax}, non-zero={n_nonzero}", flush=True)
 
     # Only add new extra dims for dimensions not already in merged; overwrite existing in place
-    if dims_to_add_new:
-        extra_params = []
-        for name, dtype in dims_to_add_new.items():
-            if name in orig_extra_dim_info:
-                extra_params.append(
-                    extra_bytes_params_from_dimension_info(orig_extra_dim_info[name], name=name)
-                )
-            else:
-                extra_params.append(laspy.ExtraBytesParams(name=name, type=dtype))
+    extra_params = []
+    for name, dtype in dims_to_add_new.items():
+        if name in orig_extra_dim_info:
+            extra_params.append(
+                extra_bytes_params_from_dimension_info(orig_extra_dim_info[name], name=name)
+            )
+        else:
+            extra_params.append(laspy.ExtraBytesParams(name=name, type=dtype))
+    # Collision dimensions from originals (added under base_1, etc.)
+    orig_name_by_out = {out_name: name for name, out_name in orig_rename_for_merged.items()}
+    for out_name, dtype in dims_to_add_renamed.items():
+        orig_name = orig_name_by_out.get(out_name)
+        if orig_name is not None and orig_name in orig_extra_dim_info:
+            extra_params.append(
+                extra_bytes_params_from_dimension_info(orig_extra_dim_info[orig_name], name=out_name)
+            )
+        else:
+            extra_params.append(laspy.ExtraBytesParams(name=out_name, type=dtype))
+    if extra_params:
         merged.add_extra_dims(extra_params)
+    # Overwrite: use original-file values (ground truth); cast to merged's dtype for packed subfields.
+    # New dims: pass float64 as-is.
     for name, arr in new_arrays.items():
-        target_view = getattr(merged, name, None)
-        if target_view is not None and hasattr(target_view, "dtype"):
-            setattr(merged, name, np.asarray(arr, dtype=np.asarray(target_view).dtype))
+        if name in dims_to_overwrite:
+            target_view = getattr(merged, name, None)
+            if target_view is not None and hasattr(target_view, "dtype"):
+                arr = np.asarray(arr, dtype=np.asarray(target_view).dtype)
+            setattr(merged, name, arr)
         else:
             setattr(merged, name, arr)
 
@@ -2304,6 +2374,8 @@ def merge_tiles(
     match_all_instances: bool = False,
     instance_dimension: str = "PredInstance",
     transfer_original_dims_to_merged: bool = True,
+    threedtrees_dims: Optional[List[str]] = None,
+    threedtrees_suffix: str = "SAT",
 ):
     """
     Main merge function implementing the tile merging pipeline.
@@ -2396,6 +2468,8 @@ def merge_tiles(
                 tolerance=retile_max_radius,
                 num_threads=num_threads,
                 retile_buffer=retile_buffer,
+                threedtrees_dims=threedtrees_dims,
+                threedtrees_suffix=threedtrees_suffix,
             )
             print(f"  ✓ Stage 7 completed: Remapped to original input files")
         else:
@@ -3687,6 +3761,8 @@ def merge_tiles(
             tolerance=0.1,
             num_threads=num_threads,
             retile_buffer=retile_buffer,
+            threedtrees_dims=threedtrees_dims,
+            threedtrees_suffix=threedtrees_suffix,
         )
         print(f"  ✓ Stage 7 completed: Remapped to original input files")
     else:

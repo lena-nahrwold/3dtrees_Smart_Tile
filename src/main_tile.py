@@ -111,11 +111,12 @@ def build_tindex(input_dir: Path, output_gpkg: Path) -> Path:
     print(f"  Found {len(source_files)} source files")
     print(f"  Output: {output_gpkg}")
 
-    # Create file list for pdal tindex (absolute paths, one per line)
-    # Use a temp file so it's in a writable location regardless of output_dir permissions
+    # Create file list for pdal tindex (absolute paths, one per line).
+    # Use the path as-is (do not resolve symlinks) so the path keeps .laz/.las extension;
+    # Galaxy stages files as .dat and we symlink to input_dir/*.laz - resolving would give .dat and PDAL would fail.
     with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
         for pf in source_files:
-            f.write(f"{pf.resolve()}\n")
+            f.write(f"{pf.absolute()}\n")
         file_list_path = Path(f.name)
 
     try:

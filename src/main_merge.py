@@ -23,7 +23,7 @@ import argparse
 import shutil
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 # Import parameters and core merge function
 from parameters import MERGE_PARAMS
@@ -54,6 +54,8 @@ def run_merge(
     retile_max_radius: float = 0.1,
     instance_dimension: str = "PredInstance",
     transfer_original_dims_to_merged: bool = True,
+    threedtrees_dims: Optional[List[str]] = None,
+    threedtrees_suffix: str = "SAT",
 ) -> Path:
     """
     Run the tile merge pipeline.
@@ -170,7 +172,9 @@ def run_merge(
             _, success, message, point_count = remap_single_tile(
                 remapped_1cm_file,
                 original_file,
-                final_output_file
+                final_output_file,
+                threedtrees_dims=set(threedtrees_dims) if threedtrees_dims else None,
+                threedtrees_suffix=threedtrees_suffix,
             )
 
             if not success:
@@ -261,8 +265,10 @@ def run_merge(
         retile_buffer=retile_buffer,
         instance_dimension=instance_dimension,
         transfer_original_dims_to_merged=transfer_original_dims_to_merged,
+        threedtrees_dims=threedtrees_dims,
+        threedtrees_suffix=threedtrees_suffix,
     )
-    
+
     return output_merged
 
 

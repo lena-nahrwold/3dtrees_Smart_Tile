@@ -30,7 +30,7 @@ class Parameters(BaseSettings):
     
     task: str = Field(
         "tile",
-        description="Task to perform: 'tile' (tiling + subsampling), 'remap' (remap predictions), 'merge' (remap + merge), or 'remap_merge' (remap then merge)",
+        description="Task to perform: 'tile' (tiling + subsampling), 'merge' (remap + merge), or 'remap' (merged file -> original files)",
     )
     
     input_dir: Optional[Path] = Field(
@@ -151,7 +151,7 @@ class Parameters(BaseSettings):
 
     tile_bounds_json: Optional[Path] = Field(
         default=None,
-        description="Path to tile_bounds_tindex.json for neighbor graph and remap matching (merge/remap_merge). If set, used instead of auto-derived paths.",
+        description="Path to tile_bounds_tindex.json for neighbor graph and remap matching (merge task). If set, used instead of auto-derived paths.",
         validation_alias=AliasChoices("tile-bounds-json", "tile_bounds_json"),
     )
     
@@ -185,20 +185,32 @@ class Parameters(BaseSettings):
 
     merged_laz: Optional[Path] = Field(
         default=None,
-        description="Path to merged LAZ file (for 'remap_to_originals' task). All dimensions from this file are added to original files.",
+        description="Path to merged LAZ file (for 'remap' task). All dimensions from this file are added to original files.",
         validation_alias=AliasChoices("merged-laz", "merged_laz"),
     )
 
     output_merged_with_originals: Optional[Path] = Field(
         default=None,
-        description="Path for merged LAZ with original-file dimensions added (for remap_to_originals). If unset, default to output_dir / merged_with_originals.laz.",
+        description="Path for merged LAZ with original-file dimensions added (for remap task). If unset, default to output_dir / merged_with_originals.laz.",
         validation_alias=AliasChoices("output-merged-with-originals", "output_merged_with_originals"),
     )
 
     transfer_original_dims_to_merged: bool = Field(
         True,
-        description="Transfer original-file dimensions (e.g. Intensity, RGB) to the merged point cloud. Applies to merge task (single-file path) and remap_to_originals task.",
+        description="Transfer original-file dimensions (e.g. Intensity, RGB) to the merged point cloud. Applies to merge task (single-file path) and remap task.",
         validation_alias=AliasChoices("transfer-original-dims-to-merged", "transfer_original_dims_to_merged"),
+    )
+
+    threedtrees_dims: str = Field(
+        "PredInstance,PredSemantic",
+        description="Comma-separated list of dimension names produced by 3DTrees to transfer to original files. These are renamed to 3DT_{name}_{suffix} in the output (e.g. 3DT_PredInstance_SAT).",
+        validation_alias=AliasChoices("threedtrees-dims", "threedtrees_dims"),
+    )
+
+    threedtrees_suffix: str = Field(
+        "SAT",
+        description="Suffix for 3DTrees dimension branding (e.g. SAT → 3DT_PredInstance_SAT).",
+        validation_alias=AliasChoices("threedtrees-suffix", "threedtrees_suffix"),
     )
 
     # ==========================================================================

@@ -17,7 +17,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import laspy
@@ -191,19 +191,23 @@ def bounds_match(
 def remap_single_tile(
     segmented_file: Path,
     target_file: Path,
-    output_file: Path
+    output_file: Path,
+    threedtrees_dims: Optional[Set[str]] = None,
+    threedtrees_suffix: str = "SAT",
 ) -> Tuple[str, bool, str, int]:
     """
     Remap predictions from segmented file to target resolution file.
-    
+
     Uses KDTree nearest neighbor search to transfer attributes from
     the segmented (coarse) file to the target (fine) file.
-    
+
     Args:
         segmented_file: Path to segmented LAZ file (e.g., 10cm with predictions)
         target_file: Path to target resolution LAZ file (e.g., 2cm)
         output_file: Path for output LAZ file
-    
+        threedtrees_dims: If set, only transfer these dims, branded as 3DT_{name}_{suffix}
+        threedtrees_suffix: Suffix for branding (default: "SAT")
+
     Returns:
         Tuple of (tile_id, success, message, point_count)
     """
@@ -248,20 +252,27 @@ def remap_single_tile(
         
         source_extra_dims = list(segmented_las.point_format.extra_dimensions)
         target_extra_dim_names = set(target_las.point_format.dimension_names)
-        
+
         if len(source_extra_dims) == 0:
             print(f"    Warning: No extra dimensions found in segmented file")
-        
+
         # Resolve names and collect params for batch add
         dims_to_add = []  # (extra_params, source_dim_name)
         for dim_info in source_extra_dims:
             dim_name = dim_info.name
-            out_name = dim_name
-            if out_name in target_extra_dim_names:
-                suffix = 1
-                while f"{dim_name}_{suffix}" in target_extra_dim_names:
-                    suffix += 1
-                out_name = f"{dim_name}_{suffix}"
+            # If branding is active, only transfer 3DTrees dims with branded names
+            if threedtrees_dims is not None:
+                if dim_name not in threedtrees_dims:
+                    continue
+                out_name = f"3DT_{dim_name}_{threedtrees_suffix}" if threedtrees_suffix else f"3DT_{dim_name}"
+            else:
+                # No branding — use collision-safe naming
+                out_name = dim_name
+                if out_name in target_extra_dim_names:
+                    suffix = 1
+                    while f"{dim_name}_{suffix}" in target_extra_dim_names:
+                        suffix += 1
+                    out_name = f"{dim_name}_{suffix}"
             dims_to_add.append((extra_bytes_params_from_dimension_info(dim_info, name=out_name), dim_name))
             target_extra_dim_names.add(out_name)
         
