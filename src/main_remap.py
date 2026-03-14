@@ -480,6 +480,7 @@ def find_matching_files(
                     print(f"    Best candidate: {best_target.name} (IoU: {best_iou:.2f}%)")
 
             continue
+
         # Sort by match quality (method priority, then IoU)
         def match_score(match_tuple):
             target_file, match_method, iou = match_tuple
