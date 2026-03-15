@@ -50,9 +50,9 @@ This pipeline provides an end-to-end solution with two primary tasks:
 │         │                                                                       │
 │         ▼                                                                       │
 │  ┌──────────────┐     ┌──────────────┐     ┌──────────────┐                    │
-│  │ COPC         │     │ Spatial      │     │ Smart        │                    │
-│  │ Conversion   │────▶│ Index        │────▶│ Tiling       │                    │
-│  │ (untwine)    │     │ (tindex)     │     │ (with buffer)│                    │
+│  │ Spatial      │     │ Tile Grid    │     │ Two-Phase    │                    │
+│  │ Index        │────▶│ Calculation  │────▶│ Tiling       │                    │
+│  │ (tindex)     │     │ (bounds)     │     │ (laspy+COPC) │                    │
 │  └──────────────┘     └──────────────┘     └──────────────┘                    │
 │                                                   │                            │
 │                                                   ▼                            │
@@ -108,7 +108,7 @@ This pipeline provides an end-to-end solution with two primary tasks:
 
 ### High Performance
 - **Parallel processing** using Python's `ProcessPoolExecutor` for multi-core utilization
-- **COPC format optimization** for efficient spatial queries and streaming access
+- **COPC format output** via untwine (with automatic PDAL fallback) for efficient spatial queries and streaming access
 - **Memory-efficient chunking** - tiles are processed independently to minimize memory footprint
 - **Parallel subsampling** - each tile is spatially divided into chunks processed concurrently
 
@@ -142,12 +142,12 @@ This pipeline provides an end-to-end solution with two primary tasks:
 
 | Stage | Component | Description |
 |-------|-----------|-------------|
-| 1 | **COPC Conversion** | Converts input LAZ/LAS files to Cloud-Optimized Point Cloud (COPC) format using `untwine`. By default preserves all dimensions. |
-| 2 | **Spatial Index** | Creates a GeoPackage tindex using `pdal tindex` for efficient spatial queries across all input files. |
-| 3 | **Tile Bounds** | Calculates optimal tile grid based on data extent, tile size (default: 100m), and buffer (default: 20m) parameters. |
-| 4 | **Tile Creation** | Extracts point data for each tile from COPC files using spatial bounds queries. |
-| 5 | **Subsampling R1** | Downsamples tiles to resolution 1 (default: 1cm) using parallel chunk processing. |
-| 6 | **Subsampling R2** | Further downsamples to resolution 2 (default: 10cm) for neural network inference. |
+| 1 | **Spatial Index** | Creates a GeoPackage tindex using `pdal tindex` for efficient spatial queries across all input files. |
+| 2 | **Tile Bounds** | Calculates optimal tile grid based on data extent, tile size (default: 100m), and buffer (default: 20m) parameters. |
+| 3a | **Phase 1: Distribute** | Reads each source LAZ/LAS file once (in memory-efficient chunks via laspy), distributes points to overlapping tiles as intermediate part files. Per-tile offsets prevent int32 overflow. |
+| 3b | **Phase 2: COPC Conversion** | Merges part files and converts each tile to COPC format using untwine (fast, automatic fallback to PDAL). |
+| 4 | **Subsampling R1** | Downsamples COPC tiles to resolution 1 (default: 1cm) using parallel spatial chunk processing. |
+| 5 | **Subsampling R2** | Further downsamples to resolution 2 (default: 10cm) for neural network inference. |
 
 #### MERGE TASK: Result Integration
 
@@ -174,7 +174,7 @@ This pipeline provides an end-to-end solution with two primary tasks:
 mamba create -n 3dtrees -c conda-forge \
     python=3.10 \
     pdal=2.6 \
-    python-pdal \
+    untwine \
     gdal \
     laspy \
     lazrs-python \
@@ -189,15 +189,6 @@ mamba create -n 3dtrees -c conda-forge \
 
 # Activate environment
 conda activate 3dtrees
-
-# Build pdal_wrench from source (required for parallel operations)
-git clone --depth 1 https://github.com/PDAL/wrench.git
-cd wrench
-mkdir build && cd build
-cmake ..
-make -j$(nproc)
-sudo cp pdal_wrench /usr/local/bin/
-cd ../..
 
 # Verify installation
 python src/run.py --show-params
@@ -299,26 +290,7 @@ python src/run.py --task merge \
 
 ## Pipeline Stages
 
-### Stage 1: COPC Conversion
-
-**Purpose**: Convert input LAZ/LAS files to Cloud-Optimized Point Cloud (COPC) format.
-
-**Technology**: Uses `untwine` for efficient COPC creation with spatial indexing.
-
-**Options**:
-- **Default (preserve all dimensions)**: Keeps all point attributes (PredInstance, species_id, etc.)
-- **XYZ-only**: Set `--skip-dimension-reduction false` to reduce to X, Y, Z only for ~37% file size reduction (useful for raw pre-segmentation data)
-
-**Example**:
-```bash
-# Preserve all dimensions (default, for post-segmentation data)
-python src/run.py --task tile --input-dir /data/in --output-dir /data/out
-
-# XYZ-only (for raw pre-segmentation data)
-python src/run.py --task tile --input-dir /data/in --output-dir /data/out --skip-dimension-reduction false
-```
-
-### Stage 2: Spatial Indexing
+### Stage 1: Spatial Indexing
 
 **Purpose**: Create a spatial index (tindex) for efficient querying across all input files.
 
@@ -326,7 +298,7 @@ python src/run.py --task tile --input-dir /data/in --output-dir /data/out --skip
 
 **Output**: `tindex_100m.gpkg` containing polygons representing each input file's extent.
 
-### Stage 3: Tile Grid Calculation
+### Stage 2: Tile Grid Calculation
 
 **Purpose**: Compute optimal tile boundaries based on data extent and parameters.
 
@@ -342,20 +314,29 @@ python src/run.py --task tile --input-dir /data/in --output-dir /data/out --skip
 - `tile_jobs_100m.txt`: Per-tile processing instructions
 - `overview_copc_tiles.png`: Visualization of tiles and input files
 
-### Stage 4: Tile Creation
+### Stage 3: Tile Creation (Two-Phase)
 
-**Purpose**: Extract points for each tile from COPC files using spatial queries.
+**Purpose**: Distribute points from source LAZ/LAS files into spatially partitioned tiles in COPC format.
 
-**Process**:
-1. For each tile, read bounds from job file
-2. Query all COPC files that intersect tile bounds
-3. Extract points using PDAL `readers.copc` with bounds parameter
-4. Merge parts from multiple input files
-5. Write as `c{col}_r{row}.copc.laz`
+#### Phase 1: Distribute
 
-**Parallelization**: Multiple tiles processed concurrently (controlled by `--workers`)
+Each source file is read once using laspy (in memory-efficient chunks controlled by `--chunk-size`). Points are distributed to all overlapping tiles as intermediate `.las` part files. Per-tile offsets are computed from tile bounds to prevent int32 overflow in scaled coordinates.
 
-### Stage 5-6: Multi-Resolution Subsampling
+**Parallelization**: One source file at a time, but tile writing is batched.
+
+#### Phase 2: COPC Conversion
+
+All part files for each tile are merged and converted to COPC format. The pipeline tries **untwine** first (fast, purpose-built for COPC generation) and automatically falls back to PDAL's `writers.copc` if untwine is not available.
+
+**Parallelization**: Multiple tiles converted concurrently (controlled by `--workers`).
+
+**Output**: `c{col}_r{row}.copc.laz` files in `tiles_{tile_length}m/`.
+
+**Options**:
+- **Default (preserve all dimensions)**: Keeps all point attributes (PredInstance, species_id, etc.)
+- **XYZ-only**: Set `--skip-dimension-reduction false` to reduce to X, Y, Z only (useful for raw pre-segmentation data)
+
+### Stage 4-5: Multi-Resolution Subsampling
 
 **Purpose**: Create downsampled versions for efficient neural network processing.
 
@@ -568,13 +549,14 @@ Tile A (east border)         Tile B (west border)
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--tile-length` | 300 | Tile size in meters |
+| `--tile-length` | 100 | Tile size in meters |
 | `--tile-buffer` | 20 | Buffer overlap in meters |
-| `--threads` | 5 | Spatial chunks per file during subsampling |
+| `--threads` | 10 | Threads per COPC writer |
 | `--workers` | 4 | Parallel file/tile processing |
 | `--resolution-1` | 0.01 | First subsampling resolution (1cm) |
 | `--resolution-2` | 0.1 | Second subsampling resolution (10cm) |
-| `--skip-dimension-reduction` | True | Keep all point dimensions (default: preserve all) |
+| `--skip-dimension-reduction` | False | Skip XYZ-only reduction, keep all point dimensions |
+| `--chunk-size` | 20000000 | Points per chunk when reading LAZ/LAS in Phase 1 (smaller = less peak RAM) |
 | `--tiling-threshold` | None | File size threshold in MB for skipping tiling on single small files |
 
 ### Merge Task Parameters
@@ -653,12 +635,8 @@ Optional override for number of spatial chunks per tile during subsampling. If n
 
 ```
 output_dir/
-├── copc_YYYYMMDD_HHMMSS/        # COPC files (preserves all dimensions by default)
-│   ├── input_file_1.copc.laz
-│   └── input_file_2.copc.laz
-│
 ├── tiles_100m/                  # Tiled point clouds (100m default)
-│   ├── c00_r00.copc.laz
+│   ├── c00_r00.copc.laz         # COPC tiles (Phase 2 output)
 │   ├── c00_r01.copc.laz
 │   ├── c01_r00.copc.laz
 │   │
@@ -670,7 +648,7 @@ output_dir/
 │   │   ├── output_100m_c00_r00_10cm.laz
 │   │   └── ...
 │   │
-│   ├── segmented_remapped/      # Remapped predictions
+│   ├── segmented_remapped/      # Remapped predictions (merge task)
 │   │   ├── c00_r00_segmented_remapped.laz
 │   │   └── ...
 │   │
@@ -678,7 +656,7 @@ output_dir/
 │       ├── c00_r00.copc.laz
 │       └── ...
 │
-├── original_with_predictions/   # Original files with PredInstance
+├── original_with_predictions/   # Original files with PredInstance (merge task)
 │   ├── input_file_1.laz
 │   └── input_file_2.laz
 │
@@ -694,7 +672,8 @@ output_dir/
 
 #### Tile Task Output
 - `X`, `Y`, `Z`: 3D coordinates
-- Additional dimensions if `--skip-dimension-reduction` is used
+- All extra dimensions preserved by default (PredInstance, species_id, etc.)
+- Set `--skip-dimension-reduction false` to reduce to XYZ only (for raw pre-segmentation data)
 
 #### Merge Task Output
 - `X`, `Y`, `Z`: 3D coordinates
@@ -826,7 +805,8 @@ This automated workflow:
 - Check PATH environment variable
 
 #### "untwine: command not found"
-- Build from source or install via conda: `conda install -c conda-forge untwine`
+- The pipeline automatically falls back to PDAL's `writers.copc` if untwine is not installed, so this is not an error — just slower COPC conversion.
+- To install for better performance: `conda install -c conda-forge untwine`
 - Verify: `untwine --help`
 
 #### "Memory allocation failed"
@@ -913,7 +893,7 @@ htop -p $(pgrep -f "python src/run.py")
 |--------|---------|
 | `run.py` | CLI entry point, task routing, parameter handling |
 | `parameters.py` | Pydantic-based parameter definitions with CLI support |
-| `main_tile.py` | COPC conversion, tindex creation, tile extraction |
+| `main_tile.py` | Two-phase tiling (distribute + COPC conversion), tindex creation |
 | `main_subsample.py` | Parallel voxel-based subsampling |
 | `main_remap.py` | KDTree-based prediction remapping |
 | `main_merge.py` | Merge task orchestration |
@@ -932,8 +912,8 @@ htop -p $(pgrep -f "python src/run.py")
 | Package | Version | Purpose |
 |---------|---------|---------|
 | Python | ≥3.10 | Runtime |
-| PDAL | ≥2.5 | Point cloud processing |
-| pdal_wrench | Latest | Parallel PDAL operations |
+| PDAL | ≥2.5 | Point cloud processing, subsampling |
+| untwine | Latest | Fast COPC conversion (auto-fallback to PDAL if unavailable) |
 | laspy | Latest | LAZ/LAS file I/O |
 | lazrs-python | Latest | LAZ compression |
 | NumPy | Latest | Array operations |
@@ -954,8 +934,7 @@ htop -p $(pgrep -f "python src/run.py")
 
 | Tool | Purpose |
 |------|---------|
-| [untwine](https://github.com/hobuinc/untwine) | COPC conversion |
-| [pdal_wrench](https://github.com/PDAL/wrench) | Parallel PDAL |
+| [untwine](https://github.com/hobuinc/untwine) | COPC conversion (preferred, auto-fallback to PDAL) |
 
 ---
 

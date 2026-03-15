@@ -115,12 +115,6 @@ class Parameters(BaseSettings):
         validation_alias=AliasChoices("chunk-size", "chunk_size"),
     )
 
-    finalize_strategy: str = Field(
-        "pdal",
-        description="Tile finalization strategy for tiling Phase 2: 'pdal' or 'laspy' (only for 'tile' task)",
-        validation_alias=AliasChoices("finalize-strategy", "finalize_strategy"),
-    )
-
     # ==========================================================================
     # Merge task parameters
     # ==========================================================================
@@ -347,14 +341,6 @@ class Parameters(BaseSettings):
             raise ValueError(f"{info.field_name} must be positive")
         return v
 
-    @field_validator("finalize_strategy")
-    @classmethod
-    def validate_finalize_strategy(cls, v):
-        """Validate tile finalization strategy."""
-        if v not in {"pdal", "laspy"}:
-            raise ValueError("finalize_strategy must be either 'pdal' or 'laspy'")
-        return v
-    
     # ==========================================================================
     # Model configuration
     # ==========================================================================
@@ -386,7 +372,6 @@ def print_params(params: Parameters):
     print(f"  tile_buffer: {params.tile_buffer}")
     print(f"  threads: {params.threads}")
     print(f"  chunk_size: {params.chunk_size}")
-    print(f"  finalize_strategy: {params.finalize_strategy}")
     print(f"  resolution_1: {params.resolution_1}")
     print(f"  resolution_2: {params.resolution_2}")
     print(f"  skip_dimension_reduction: {params.skip_dimension_reduction}")
@@ -417,7 +402,6 @@ def get_tile_params(params: Parameters) -> dict:
         'resolution_2': params.resolution_2,
         'skip_dimension_reduction': params.skip_dimension_reduction,
         'chunk_size': params.chunk_size,
-        'finalize_strategy': params.finalize_strategy,
     }
 
 
@@ -453,7 +437,6 @@ TILE_PARAMS = {
     'resolution_2': 0.1,
     'skip_dimension_reduction': False,
     'chunk_size': 20_000_000,
-    'finalize_strategy': 'pdal',
 }
 
 REMAP_PARAMS = {

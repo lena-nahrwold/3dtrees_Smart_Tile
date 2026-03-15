@@ -83,8 +83,6 @@ def run_tile_task(params: Parameters):
     res2 = params.resolution_2
     tiling_threshold = params.tiling_threshold
     chunk_size = params.chunk_size
-    finalize_strategy = params.finalize_strategy
-
     print("=" * 60)
     print("Running Tile Task (Python Pipeline)")
     print("=" * 60)
@@ -101,7 +99,6 @@ def run_tile_task(params: Parameters):
     if tiling_threshold is not None:
         print(f"Tiling threshold: {tiling_threshold} MB")
     print(f"Chunk size: {chunk_size:,} points")
-    print(f"Finalize strategy: {finalize_strategy}")
     print()
 
     try:
@@ -117,7 +114,6 @@ def run_tile_task(params: Parameters):
             dimension_reduction=dimension_reduction,
             tiling_threshold=tiling_threshold,
             chunk_size=chunk_size,
-            finalize_strategy=finalize_strategy,
         )
 
         # Check if tiling was skipped (returns copc_dir instead of tiles_dir)

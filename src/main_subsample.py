@@ -157,9 +157,35 @@ def subsample_tile_chunk(args: Tuple[Path, str, float, Path, int, int, bool]) ->
             pipeline_file.unlink()
         
         if result.returncode != 0:
-            print(f"      ⚠ Chunk {chunk_idx}/{total_chunks} error: {result.stderr[:100]}")
-            return (None, 0)
-        
+            # Fallback: if COPC reader failed, retry with readers.las + filters.crop
+            if is_copc and ("copc" in result.stderr.lower() or "vlr" in result.stderr.lower()):
+                print(f"      ⚠ Chunk {chunk_idx}/{total_chunks}: COPC reader failed, falling back to readers.las")
+                pipeline = {
+                    "pipeline": [
+                        {"type": "readers.las", "filename": str(input_file)},
+                        {"type": "filters.crop", "bounds": bounds_str},
+                        {"type": "filters.voxelcentroidnearestneighbor", "cell": resolution},
+                        writer_opts,
+                    ]
+                }
+                pipeline_file = output_dir / f"_pipeline_chunk{chunk_idx}_fallback.json"
+                with open(pipeline_file, 'w') as f:
+                    json.dump(pipeline, f, indent=2)
+                try:
+                    result = subprocess.run(
+                        [pdal_cmd, "pipeline", str(pipeline_file)],
+                        capture_output=True, text=True, check=False,
+                    )
+                finally:
+                    if pipeline_file.exists():
+                        pipeline_file.unlink()
+                if result.returncode != 0:
+                    print(f"      ⚠ Chunk {chunk_idx}/{total_chunks} fallback error: {result.stderr[:100]}")
+                    return (None, 0)
+            else:
+                print(f"      ⚠ Chunk {chunk_idx}/{total_chunks} error: {result.stderr[:100]}")
+                return (None, 0)
+
         if not chunk_file.exists() or chunk_file.stat().st_size == 0:
             return (None, 0)
         
@@ -401,11 +427,35 @@ def subsample_simple(
             pipeline_file.unlink()
         
         if result.returncode != 0:
-            return (input_file.name, False, result.stderr[:200], 0)
-        
+            # Fallback: if COPC reader failed, retry with readers.las
+            if is_copc and ("copc" in result.stderr.lower() or "vlr" in result.stderr.lower()):
+                print(f"    ⚠ {input_file.name}: COPC reader failed, falling back to readers.las")
+                pipeline = {
+                    "pipeline": [
+                        {"type": "readers.las", "filename": str(input_file)},
+                        {"type": "filters.voxelcentroidnearestneighbor", "cell": resolution},
+                        writer_opts,
+                    ]
+                }
+                pipeline_file = pipeline_dir / f"{input_file.stem}_simple_fallback.json"
+                with open(pipeline_file, 'w') as f:
+                    json.dump(pipeline, f, indent=2)
+                try:
+                    result = subprocess.run(
+                        [pdal_cmd, "pipeline", str(pipeline_file)],
+                        capture_output=True, text=True, check=False,
+                    )
+                finally:
+                    if pipeline_file.exists():
+                        pipeline_file.unlink()
+                if result.returncode != 0:
+                    return (input_file.name, False, result.stderr[:200], 0)
+            else:
+                return (input_file.name, False, result.stderr[:200], 0)
+
         if not output_file.exists() or output_file.stat().st_size == 0:
             return (input_file.name, False, "Output file empty", 0)
-        
+
         # Get point count
         point_count = 0
         try:

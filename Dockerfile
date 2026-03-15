@@ -1,7 +1,8 @@
 # =============================================================================
 # 3DTrees Smart Tile Pipeline - Dockerfile
 # =============================================================================
-# Single-stage build. Pipeline uses laspy + PDAL only (no untwine).
+# Single-stage build. Pipeline uses laspy + PDAL + untwine.
+# Untwine is the default COPC conversion strategy (fast).
 # =============================================================================
 
 FROM condaforge/miniforge3:latest
@@ -11,6 +12,7 @@ RUN mamba install -n base -c conda-forge \
     python=3.10 \
     pdal \
     gdal \
+    untwine \
     -y && \
     mamba clean --all -y
 
@@ -33,8 +35,9 @@ RUN uv pip install --system \
     pydantic \
     pydantic-settings
 
-# Verify PDAL
+# Verify PDAL and untwine
 RUN pdal --version
+RUN untwine --help > /dev/null 2>&1 && echo "untwine OK" || echo "WARNING: untwine not available"
 
 # ===========================================
 # Setup project

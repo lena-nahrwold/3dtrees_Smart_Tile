@@ -5,9 +5,9 @@ Main tiling script: index building and tiling from LAZ/LAS input.
 This script handles the first phase of the 3DTrees pipeline:
 1. Build spatial index (tindex) from input LAZ/LAS files
 2. Calculate tile bounds
-3. Create overlapping tiles (laspy crop + PDAL merge to COPC)
+3. Create overlapping tiles (laspy crop, COPC conversion via PDAL or untwine)
 
-Uses laspy and PDAL only; no untwine.
+Uses laspy for Phase 1 (distribute/crop) and PDAL or untwine for Phase 2 (COPC).
 
 Usage:
     python main_tile.py --input_dir /path/to/input --output_dir /path/to/output
@@ -396,6 +396,57 @@ def filter_source_files_for_tile(
     return result
 
 
+def _make_tile_header(header_snapshot, offsets=None, scales=None):
+    """Create a LasHeader from a source header, copying VLRs and extra dimensions.
+
+    Args:
+        header_snapshot: Source laspy header to copy from.
+        offsets: Optional XYZ offsets. Defaults to source header offsets.
+        scales: Optional XYZ scales. Defaults to source header scales.
+
+    Returns:
+        A new laspy.LasHeader ready for writing.
+    """
+    import laspy
+
+    hdr = laspy.LasHeader(
+        point_format=header_snapshot.point_format,
+        version=header_snapshot.version,
+    )
+    hdr.offsets = offsets if offsets is not None else header_snapshot.offsets
+    hdr.scales = scales if scales is not None else header_snapshot.scales
+
+    # Copy non-COPC VLRs, avoiding duplicates
+    existing_vlr_keys = {
+        (getattr(v, "user_id", ""), v.record_id) for v in hdr.vlrs
+    }
+    for vlr in header_snapshot.vlrs:
+        if vlr.record_id in (1, 2) and getattr(vlr, "user_id", "") == "copc":
+            continue
+        vlr_key = (getattr(vlr, "user_id", ""), vlr.record_id)
+        if vlr_key not in existing_vlr_keys:
+            hdr.vlrs.append(vlr)
+            existing_vlr_keys.add(vlr_key)
+
+    # Copy extra dimensions
+    try:
+        extra_dims_src = getattr(header_snapshot.point_format, "extra_dimensions", None)
+        if extra_dims_src:
+            extra_dims_dst = getattr(hdr.point_format, "extra_dimensions", None)
+            existing = {d.name for d in (extra_dims_dst or [])}
+            for dim in extra_dims_src:
+                if dim.name not in existing:
+                    hdr.add_extra_dim(laspy.ExtraBytesParams(
+                        name=dim.name, type=dim.dtype,
+                        description=getattr(dim, "description", "") or "",
+                    ))
+                    existing.add(dim.name)
+    except Exception:
+        pass
+
+    return hdr
+
+
 def _crop_with_laspy(
     input_file: str,
     output_file: Path,
@@ -441,37 +492,7 @@ def _crop_with_laspy(
 
         cropped = las.points[mask]
 
-        new_header = laspy.LasHeader(
-            point_format=las.header.point_format,
-            version=las.header.version,
-        )
-        new_header.offsets = las.header.offsets
-        new_header.scales = las.header.scales
-        # Copy non-COPC VLRs from source, avoiding duplicates
-        existing_vlr_keys = {
-            (getattr(v, "user_id", ""), v.record_id) for v in new_header.vlrs
-        }
-        for vlr in las.header.vlrs:
-            if vlr.record_id in (1, 2) and getattr(vlr, "user_id", "") == "copc":
-                continue
-            vlr_key = (getattr(vlr, "user_id", ""), vlr.record_id)
-            if vlr_key not in existing_vlr_keys:
-                new_header.vlrs.append(vlr)
-                existing_vlr_keys.add(vlr_key)
-        # Copy extra dimensions (laspy 2.x: header.point_format.extra_dimensions)
-        try:
-            extra_dims_src = getattr(las.header.point_format, "extra_dimensions", None)
-            if extra_dims_src:
-                extra_dims_dst = getattr(new_header.point_format, "extra_dimensions", None)
-                existing = {d.name for d in (extra_dims_dst or [])}
-                for dim in extra_dims_src:
-                    if dim.name not in existing:
-                        new_header.add_extra_dim(laspy.ExtraBytesParams(
-                            name=dim.name, type=dim.dtype, description=getattr(dim, "description", "") or "",
-                        ))
-                        existing.add(dim.name)
-        except Exception:
-            pass  # Header may already match; write with standard dims if needed
+        new_header = _make_tile_header(las.header)
 
         new_las = laspy.LasData(new_header)
         new_las.points = cropped
@@ -568,39 +589,11 @@ def _distribute_source_file(args: Tuple) -> List[Tuple[str, int]]:
         # --- write one part file per tile that received points -----------------
         # Keep intermediate parts uncompressed so Phase 1 avoids repeated LAZ
         # compression work before the final COPC write.
-        # Build output header once (shared across all parts from this source)
-        new_header = laspy.LasHeader(
-            point_format=header_snapshot.point_format,
-            version=header_snapshot.version,
-        )
-        new_header.offsets = header_snapshot.offsets
-        new_header.scales = header_snapshot.scales
-        # Copy non-COPC VLRs, avoiding duplicates
-        existing_vlr_keys = {
-            (getattr(v, "user_id", ""), v.record_id) for v in new_header.vlrs
-        }
-        for vlr in header_snapshot.vlrs:
-            if vlr.record_id in (1, 2) and getattr(vlr, "user_id", "") == "copc":
-                continue
-            vlr_key = (getattr(vlr, "user_id", ""), vlr.record_id)
-            if vlr_key not in existing_vlr_keys:
-                new_header.vlrs.append(vlr)
-                existing_vlr_keys.add(vlr_key)
-        # Copy extra dimensions
-        try:
-            extra_dims_src = getattr(header_snapshot.point_format, "extra_dimensions", None)
-            if extra_dims_src:
-                extra_dims_dst = getattr(new_header.point_format, "extra_dimensions", None)
-                existing = {d.name for d in (extra_dims_dst or [])}
-                for dim in extra_dims_src:
-                    if dim.name not in existing:
-                        new_header.add_extra_dim(laspy.ExtraBytesParams(
-                            name=dim.name, type=dim.dtype,
-                            description=getattr(dim, "description", "") or "",
-                        ))
-                        existing.add(dim.name)
-        except Exception:
-            pass
+        # Build per-tile headers with tile-centered offsets to prevent int32
+        # overflow when coordinates are far from the source file's offset.
+        src_scales = header_snapshot.scales
+        src_offsets = header_snapshot.offsets
+        tile_bounds_map = {lbl: bnds for lbl, bnds in overlapping_tiles}
 
         results: List[Tuple[str, int]] = []
         for label in tile_labels:
@@ -611,6 +604,22 @@ def _distribute_source_file(args: Tuple) -> List[Tuple[str, int]]:
             part_file = tile_dir / f"part_{source_idx}.las"
 
             combined = np.concatenate(tile_arrays[label])
+
+            # Compute tile-centered offsets to keep scaled values within int32
+            bxmin, bymin, bxmax, bymax = tile_bounds_map[label]
+            tile_offsets = np.array([
+                (bxmin + bxmax) / 2.0,
+                (bymin + bymax) / 2.0,
+                src_offsets[2],
+            ])
+
+            # Re-encode X/Y with tile-specific offsets
+            real_x = combined['X'] * src_scales[0] + src_offsets[0]
+            real_y = combined['Y'] * src_scales[1] + src_offsets[1]
+            combined['X'] = np.round((real_x - tile_offsets[0]) / src_scales[0]).astype(np.int32)
+            combined['Y'] = np.round((real_y - tile_offsets[1]) / src_scales[1]).astype(np.int32)
+
+            new_header = _make_tile_header(header_snapshot, offsets=tile_offsets)
             point_record = laspy.ScaleAwarePointRecord(
                 combined, new_header.point_format, new_header.scales, new_header.offsets,
             )
@@ -631,13 +640,16 @@ def _finalize_tile_to_copc(args: Tuple) -> Tuple[str, bool, str]:
     """
     Phase 2: Merge a tile's LAZ part files into a single COPC tile.
 
+    Tries untwine first (fast), falls back to PDAL if unavailable.
+
     Args:
-        args: (label, tiles_dir, log_dir)
+        args: (label, tiles_dir, log_dir, tile_bounds)
+              tile_bounds: (xmin, ymin, xmax, ymax) or None
 
     Returns:
         (label, success, message)
     """
-    label, tiles_dir, log_dir, finalize_strategy = args
+    label, tiles_dir, log_dir, tile_bounds = args
 
     final_tile = tiles_dir / f"{label}.copc.laz"
 
@@ -656,10 +668,8 @@ def _finalize_tile_to_copc(args: Tuple) -> Tuple[str, bool, str]:
         return (label, True, "No data in bounds")
 
     try:
-        if finalize_strategy == "laspy":
-            success, message = _finalize_tile_to_copc_laspy(parts, final_tile)
-        else:
-            success, message = _finalize_tile_to_copc_pdal(parts, final_tile, log_dir, label)
+        # Try untwine first (fast), fall back to PDAL
+        success, message = _finalize_tile_to_copc_untwine(parts, final_tile, log_dir, label)
 
         if not success:
             return (label, False, message)
@@ -671,7 +681,7 @@ def _finalize_tile_to_copc(args: Tuple) -> Tuple[str, bool, str]:
         if tile_dir.exists() and not any(tile_dir.iterdir()):
             tile_dir.rmdir()
 
-        return (label, True, f"{len(parts)} parts merged via {finalize_strategy}")
+        return (label, True, f"{len(parts)} parts merged ({message})")
 
     except Exception as e:
         return (label, False, str(e))
@@ -682,20 +692,29 @@ def _finalize_tile_to_copc_pdal(
     final_tile: Path,
     log_dir: Path,
     label: str,
+    tile_bounds: Optional[Tuple[float, float, float, float]] = None,
 ) -> Tuple[bool, str]:
     """Finalize a tile with the existing PDAL merge pipeline."""
     pdal_cmd = get_pdal_path()
+
+    # Build COPC writer config with explicit offsets from tile bounds
+    # to prevent int32 overflow on scaled coordinate values.
+    writer_opts = {
+        "type": "writers.copc",
+        "filename": str(final_tile),
+        "forward": "all",
+        "extra_dims": "all",
+    }
+    if tile_bounds is not None:
+        bxmin, bymin, bxmax, bymax = tile_bounds
+        writer_opts["offset_x"] = (bxmin + bxmax) / 2.0
+        writer_opts["offset_y"] = (bymin + bymax) / 2.0
 
     if len(parts) == 1:
         pipeline = {
             "pipeline": [
                 {"type": "readers.las", "filename": str(parts[0])},
-                {
-                    "type": "writers.copc",
-                    "filename": str(final_tile),
-                    "forward": "all",
-                    "extra_dims": "all",
-                },
+                writer_opts,
             ]
         }
     else:
@@ -703,12 +722,7 @@ def _finalize_tile_to_copc_pdal(
         pipeline = {
             "pipeline": readers + [
                 {"type": "filters.merge"},
-                {
-                    "type": "writers.copc",
-                    "filename": str(final_tile),
-                    "forward": "all",
-                    "extra_dims": "all",
-                },
+                writer_opts,
             ]
         }
 
@@ -730,89 +744,68 @@ def _finalize_tile_to_copc_pdal(
     return (True, "OK")
 
 
-def _finalize_tile_to_copc_laspy(parts: List[Path], final_tile: Path) -> Tuple[bool, str]:
-    """Finalize a tile by concatenating point records in laspy before COPC conversion."""
-    import laspy
-    import numpy as np
+def _finalize_tile_to_copc_untwine(
+    parts: List[Path],
+    final_tile: Path,
+    log_dir: Path,
+    label: str,
+) -> Tuple[bool, str]:
+    """Finalize a tile using untwine for fast COPC conversion.
 
-    laz_backend = _laspy_laz_backend()
-    read_kwargs = {}
-    write_kwargs = {}
-    if laz_backend is not None:
-        read_kwargs["laz_backend"] = laz_backend
-        write_kwargs["laz_backend"] = laz_backend
+    Untwine is purpose-built for COPC generation and significantly faster
+    than PDAL's writers.copc, especially for large point clouds.
 
-    merged_temp = final_tile.with_name(f"{final_tile.stem}_merged_tmp.las")
+    For multiple parts, passes all files directly to untwine (it supports
+    multiple input files natively).
+    """
+    untwine_cmd = shutil.which("untwine")
+    if not untwine_cmd:
+        # Fallback to PDAL if untwine is not installed
+        success, msg = _finalize_tile_to_copc_pdal(parts, final_tile, log_dir, label)
+        if success:
+            return (True, "pdal")
+        return (False, msg)
 
     try:
-        arrays = []
-        header_snapshot = None
+        input_args = []
+        for p in parts:
+            input_args.extend(["-i", str(p)])
 
-        for part in parts:
-            las = laspy.read(str(part), **read_kwargs)
-            if header_snapshot is None:
-                header_snapshot = las.header
-            arrays.append(las.points.array.copy())
-
-        if header_snapshot is None:
-            return (False, "No part data found")
-
-        if len(arrays) == 1:
-            combined = arrays[0]
-        else:
-            combined = np.concatenate(arrays)
-
-        merged_header = laspy.LasHeader(
-            point_format=header_snapshot.point_format,
-            version=header_snapshot.version,
+        result = subprocess.run(
+            [untwine_cmd] + input_args + ["-o", str(final_tile)],
+            capture_output=True, text=True, check=False,
         )
-        merged_header.offsets = header_snapshot.offsets
-        merged_header.scales = header_snapshot.scales
 
-        existing_vlr_keys = {
-            (getattr(v, "user_id", ""), v.record_id) for v in merged_header.vlrs
-        }
-        for vlr in header_snapshot.vlrs:
-            if vlr.record_id in (1, 2) and getattr(vlr, "user_id", "") == "copc":
-                continue
-            vlr_key = (getattr(vlr, "user_id", ""), vlr.record_id)
-            if vlr_key not in existing_vlr_keys:
-                merged_header.vlrs.append(vlr)
-                existing_vlr_keys.add(vlr_key)
+        if result.returncode != 0:
+            return (False, f"untwine failed: {result.stderr[:200]}")
 
+        if not final_tile.exists() or final_tile.stat().st_size == 0:
+            return (False, "untwine produced no output")
+
+        return (True, "untwine")
+
+    except Exception as e:
+        return (False, f"untwine error: {e}")
+
+
+def _convert_laz_to_copc(input_laz: Path, output_copc: Path) -> bool:
+    """Convert a single LAZ/LAS file to COPC.
+
+    Tries untwine first (fast), falls back to PDAL if unavailable.
+    """
+    untwine_cmd = shutil.which("untwine")
+    if untwine_cmd:
         try:
-            extra_dims_src = getattr(header_snapshot.point_format, "extra_dimensions", None)
-            if extra_dims_src:
-                existing = {d.name for d in getattr(merged_header.point_format, "extra_dimensions", []) or []}
-                for dim in extra_dims_src:
-                    if dim.name not in existing:
-                        merged_header.add_extra_dim(
-                            laspy.ExtraBytesParams(
-                                name=dim.name,
-                                type=dim.dtype,
-                                description=getattr(dim, "description", "") or "",
-                            )
-                        )
-                        existing.add(dim.name)
+            r = subprocess.run(
+                [untwine_cmd, "-i", str(input_laz), "-o", str(output_copc)],
+                capture_output=True, text=True, check=False,
+            )
+            if r.returncode == 0 and output_copc.exists() and output_copc.stat().st_size > 0:
+                return True
         except Exception:
             pass
 
-        point_record = laspy.ScaleAwarePointRecord(
-            combined,
-            merged_header.point_format,
-            merged_header.scales,
-            merged_header.offsets,
-        )
-        merged_las = laspy.LasData(merged_header)
-        merged_las.points = point_record
-        merged_las.write(str(merged_temp))
-
-        if not _convert_laz_to_copc_pdal(merged_temp, final_tile):
-            return (False, "LAS->COPC conversion failed after laspy merge")
-        return (True, "OK")
-    finally:
-        if merged_temp.exists():
-            merged_temp.unlink()
+    return _convert_laz_to_copc_pdal(input_laz, output_copc)
 
 
 def create_tiles(
@@ -823,7 +816,6 @@ def create_tiles(
     threads: int = 5,
     max_parallel: int = 5,
     chunk_size: int = 20_000_000,
-    finalize_strategy: str = "pdal",
 ) -> List[Path]:
     """
     Create overlapping tiles from source LAZ/LAS files (two-phase).
@@ -833,17 +825,17 @@ def create_tiles(
     the previous O(sources × tiles) read pattern.
 
     Phase 2 – Finalise: each tile's part files are merged and converted to
-    COPC format using PDAL.  Fully parallelised across tiles.
+    COPC format (tries untwine, falls back to PDAL).  Fully parallelised
+    across tiles.
 
     Args:
         tindex_file: Path to tindex GeoPackage
         tile_jobs_file: Path to tile jobs file
         tiles_dir: Output directory for tiles
         log_dir: Directory for log files
-        threads: Threads used per process for LAZ chunk decompression (LazrsParallel/Rayon); also used for Phase 2 PDAL where applicable.
+        threads: Threads used per process for LAZ chunk decompression (LazrsParallel/Rayon)
         max_parallel: Maximum parallel workers for each phase
         chunk_size: Points per chunk when reading source files (smaller = less peak RAM)
-        finalize_strategy: Phase 2 tile finalization strategy: "pdal" or "laspy"
 
     Returns:
         List of created tile paths
@@ -941,13 +933,13 @@ def create_tiles(
 
     # ── Phase 2: Finalise ───────────────────────────────────────────────
     finalize_tasks = [
-        (label, tiles_dir, log_dir, finalize_strategy) for label in pending_tiles
+        (label, tiles_dir, log_dir, pending_tiles.get(label))
+        for label in pending_tiles
     ]
 
     print()
     print(
-        f"  Phase 2: Merging & converting {len(finalize_tasks)} tile(s) to COPC "
-        f"using '{finalize_strategy}'"
+        f"  Phase 2: Merging & converting {len(finalize_tasks)} tile(s) to COPC"
     )
     print()
 
@@ -1020,18 +1012,17 @@ def run_tiling_pipeline(
     dimension_reduction: bool = True,  # Ignored (kept for API compatibility)
     tiling_threshold: float = None,
     chunk_size: int = 2_000_000,
-    finalize_strategy: str = "pdal",
 ) -> Path:
     """
-    Run the complete tiling pipeline (laspy + PDAL only).
+    Run the complete tiling pipeline.
 
     Steps:
     1. Build spatial index (tindex) from input LAZ/LAS files
     2. Calculate tile bounds
-    3. Create overlapping tiles (laspy crop, PDAL merge to COPC)
+    3. Create overlapping tiles (laspy crop, COPC conversion via untwine/PDAL)
 
     If input folder contains a single file below tiling_threshold, converts it to
-    COPC with PDAL and returns that directory for direct subsampling.
+    COPC and returns that directory for direct subsampling.
 
     Args:
         input_dir: Directory containing input LAZ/LAS files
@@ -1120,9 +1111,9 @@ def run_tiling_pipeline(
         copc_single_dir.mkdir(parents=True, exist_ok=True)
         out_copc = copc_single_dir / f"{laz_file.stem}.copc.laz"
         if not out_copc.exists() or out_copc.stat().st_size == 0:
-            print("  Converting LAZ to COPC (PDAL)...")
-            if not _convert_laz_to_copc_pdal(laz_file, out_copc):
-                raise RuntimeError(f"PDAL LAZ→COPC conversion failed: {laz_file}")
+            print("  Converting LAZ to COPC...")
+            if not _convert_laz_to_copc(laz_file, out_copc):
+                raise RuntimeError(f"LAZ→COPC conversion failed: {laz_file}")
             print(f"  ✓ Created {out_copc.name}")
         else:
             print(f"  Using existing {out_copc.name}")
@@ -1139,7 +1130,6 @@ def run_tiling_pipeline(
         threads,
         max_tile_procs,
         chunk_size,
-        finalize_strategy,
     )
 
     print()
@@ -1214,13 +1204,6 @@ def main():
         default=TILE_PARAMS.get("chunk_size", 20_000_000),
         help="Points per chunk when reading LAZ/LAS (default: 2_000_000; smaller = less peak RAM)",
     )
-    parser.add_argument(
-        "--finalize_strategy",
-        choices=("pdal", "laspy"),
-        default="pdal",
-        help="Tile finalization strategy for Phase 2 (default: pdal)",
-    )
-    
     args = parser.parse_args()
     
     # Validate input
@@ -1239,7 +1222,6 @@ def main():
             threads=args.threads,
             max_tile_procs=args.max_tile_procs,
             chunk_size=args.chunk_size,
-            finalize_strategy=args.finalize_strategy,
         )
         print(f"\nTiles ready for subsampling: {tiles_dir}")
     except Exception as e:
