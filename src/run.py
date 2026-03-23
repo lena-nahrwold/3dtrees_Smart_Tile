@@ -16,6 +16,7 @@ Usage:
 import sys
 import argparse
 from pathlib import Path
+import os
 
 # Add src directory to path for imports when run from project root
 _src_dir = Path(__file__).parent.resolve()
