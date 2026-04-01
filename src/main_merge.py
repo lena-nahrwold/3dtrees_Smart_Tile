@@ -6,10 +6,10 @@ This script wraps the merge_tiles.py functionality to provide a clean interface
 for the pipeline orchestrator.
 
 Pipeline:
-1. Load and filter (centroid-based buffer zone filtering)
+1. Load and extract metadata (core-boundary-based filtering)
 2. Assign global IDs
 3. Cross-tile instance matching
-4. Merge and deduplicate
+4. Merge with core-only spatial partitioning
 5. Small volume merging
 6. Retile to original files (required)
 
@@ -27,7 +27,8 @@ from typing import List, Optional
 
 # Import parameters and core merge function
 from parameters import MERGE_PARAMS
-from merge_tiles import add_original_dimensions_to_merged, merge_tiles as core_merge_tiles
+from merge_tiles import add_original_dimensions_to_merged
+from merge_tiles_streaming import merge_tiles_streaming as core_merge_tiles
 
 
 def run_merge(
@@ -37,7 +38,6 @@ def run_merge(
     tile_bounds_json: Path,
     original_input_dir: Optional[Path] = None,
     output_merged: Optional[Path] = None,
-    buffer: float = 10.0,
     overlap_threshold: float = 0.3,
     max_centroid_distance: float = 3.0,
     correspondence_tolerance: float = 0.05,
@@ -56,17 +56,20 @@ def run_merge(
     transfer_original_dims_to_merged: bool = True,
     threedtrees_dims: Optional[List[str]] = None,
     threedtrees_suffix: str = "SAT",
+    save_filtered_tiles_flag: bool = False,
+    enable_orphan_recovery: bool = True,
+    standardization_json: Optional[Path] = None,
+    merge_chunk_size: int = 2_000_000,
 ) -> Path:
     """
     Run the tile merge pipeline.
-    
+
     Args:
         segmented_dir: Directory containing segmented LAZ tiles
         output_tiles_dir: Output directory for retiled files
         original_tiles_dir: Directory with original tile files for retiling
         original_input_dir: Directory with original input LAZ files for final remap (optional)
         output_merged: Output path for merged LAZ file (auto-derived if None)
-        buffer: Buffer zone distance in meters
         overlap_threshold: Overlap ratio threshold for instance matching
         max_centroid_distance: Max distance between centroids to merge instances
         correspondence_tolerance: Max distance for point correspondence (internal, not exposed via Parameters)
@@ -80,7 +83,7 @@ def run_merge(
         retile_buffer: Spatial buffer expansion in meters for filtering merged points during retiling
         retile_max_radius: Maximum distance threshold in meters for cKDTree nearest neighbor matching during retiling
         transfer_original_dims_to_merged: If True (single-file path only), add original-file dimensions to the merged LAZ.
-    
+
     Returns:
         Path to merged output file
     """
@@ -120,9 +123,8 @@ def run_merge(
     if len(segmented_files) == 1 and len(original_tiles_files) == 1:
         # If original_input_dir is provided, also check it has exactly one file
         if original_input_dir:
-            original_input_files = list(original_input_dir.glob("*.laz")) + list(original_input_dir.glob("*.las"))
-            # Filter out COPC files
-            original_input_files = [f for f in original_input_files if not f.name.endswith('.copc.laz')]
+            from merge_tiles import list_pointcloud_files
+            original_input_files = list_pointcloud_files(original_input_dir)
             if len(original_input_files) == 1:
                 use_single_file_optimization = True
         else:
@@ -201,6 +203,11 @@ def run_merge(
 
             # Ensure merged file has same dimensions as original (reuse remap-to-originals logic)
             if original_input_dir and transfer_original_dims_to_merged:
+                from merge_tiles import load_standardization_dims
+                _target_dims = None
+                if standardization_json is not None:
+                    _target_dims = load_standardization_dims(standardization_json)
+                    print(f"  Standardization: filtering to {len(_target_dims)} target dimensions")
                 merged_tmp = output_merged.parent / (output_merged.stem + "_with_originals_dims.laz")
                 add_original_dimensions_to_merged(
                     output_merged,
@@ -209,6 +216,8 @@ def run_merge(
                     tolerance=0.1,
                     retile_buffer=retile_buffer,
                     num_threads=4,
+                    target_dims=_target_dims,
+                    merge_chunk_size=merge_chunk_size,
                 )
                 shutil.copy2(str(merged_tmp), str(output_merged))
                 merged_tmp.unlink(missing_ok=True)
@@ -227,7 +236,6 @@ def run_merge(
 
     print(f"Input: {segmented_dir}")
     print(f"Output merged: {output_merged}" + (" (SKIPPED)" if skip_merged_file else ""))
-    print(f"Buffer: {buffer}m")
     print(f"Instance matching: {'ENABLED' if enable_matching else 'DISABLED'}")
     if enable_matching:
         print(f"  Overlap threshold: {overlap_threshold}")
@@ -251,7 +259,6 @@ def run_merge(
         output_tiles_dir=output_tiles_dir,
         tile_bounds_json=tile_bounds_json,
         original_input_dir=original_input_dir,
-        buffer=buffer,
         overlap_threshold=overlap_threshold,
         correspondence_tolerance=correspondence_tolerance,
         max_volume_for_merge=max_volume_for_merge,
@@ -267,6 +274,10 @@ def run_merge(
         transfer_original_dims_to_merged=transfer_original_dims_to_merged,
         threedtrees_dims=threedtrees_dims,
         threedtrees_suffix=threedtrees_suffix,
+        save_filtered_tiles_flag=save_filtered_tiles_flag,
+        enable_orphan_recovery=enable_orphan_recovery,
+        standardization_json=standardization_json,
+        merge_chunk_size=merge_chunk_size,
     )
 
     return output_merged
@@ -323,13 +334,6 @@ def main() -> None:
     )
     
     parser.add_argument(
-        "--buffer",
-        type=float,
-        default=MERGE_PARAMS.get('buffer', 10.0),
-        help=f"Buffer zone distance in meters (default: {MERGE_PARAMS.get('buffer', 10.0)})"
-    )
-    
-    parser.add_argument(
         "--overlap_threshold",
         type=float,
         default=MERGE_PARAMS.get('overlap_threshold', 0.3),
@@ -376,7 +380,7 @@ def main() -> None:
         "--border_zone_width",
         type=float,
         default=MERGE_PARAMS.get('border_zone_width', 10.0),
-        help=f"Width of border zone beyond buffer for instance matching (default: {MERGE_PARAMS.get('border_zone_width', 10.0)})"
+        help=f"Width of border zone inward from core boundary for instance matching (default: {MERGE_PARAMS.get('border_zone_width', 10.0)})"
     )
 
     parser.add_argument(
@@ -434,7 +438,6 @@ def main() -> None:
             tile_bounds_json=args.tile_bounds_json,
             original_input_dir=args.original_input_dir,
             output_merged=args.output_merged,
-            buffer=args.buffer,
             overlap_threshold=args.overlap_threshold,
             max_centroid_distance=args.max_centroid_distance,
             correspondence_tolerance=args.correspondence_tolerance,

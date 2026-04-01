@@ -97,6 +97,12 @@ This pipeline provides an end-to-end solution with two primary tasks:
 │                              └───────────────────────────────────┘             │
 │                                                   │                            │
 │                                                   ▼                            │
+│                              ┌───────────────────────────────────┐             │
+│                              │ Enrich with Original Dimensions   │ (optional)  │
+│                              │ (Amplitude, Reflectance, etc.)    │             │
+│                              └───────────────────────────────────┘             │
+│                                                   │                            │
+│                                                   ▼                            │
 │                                      Unified Point Cloud                       │
 │                               (Consistent Instance IDs Across Tiles)           │
 └─────────────────────────────────────────────────────────────────────────────────┘
@@ -162,6 +168,7 @@ This pipeline provides an end-to-end solution with two primary tasks:
 | 5 | **Small Volume Merge** | Reassigns tree fragments with volume < 4m³ to nearest large instance. |
 | 6 | **Retiling** | Maps final instance IDs back to original tile boundaries for per-tile output. |
 | 7 | **Original Remap** | Maps final instance IDs back to original input LAZ files (pre-tiling, optional). |
+| 8 | **Enrichment** | Adds original-file dimensions (Amplitude, Reflectance, etc.) to the merged file (optional). |
 
 ---
 
@@ -264,8 +271,22 @@ python src/run.py --task tile \
     --resolution-1 0.01 \                  # First resolution (default: 1cm)
     --resolution-2 0.1 \                   # Second resolution (default: 10cm)
     --workers 8 \                          # Parallel workers (default: 4)
-    --threads 10                           # Threads per COPC writer (default: 10)
+    --threads 10 \                         # Threads per COPC writer (default: 10)
+    --chunkwise-copc-source-creation       # Optional: lower-RAM source COPC creation
 ```
+
+For a single large source file where you mainly want one COPC output with lower peak RAM, combine the chunkwise flag with a large `--tiling-threshold` so the tile task stops after source normalization:
+
+```bash
+python src/run.py --task tile \
+    --input-dir /path/to/input \
+    --output-dir /path/to/output \
+    --tiling-threshold 999999 \
+    --chunkwise-copc-source-creation \
+    --chunk-size 5000000
+```
+
+The resulting COPC will be written under `output/copc_single/`.
 
 ### Merge Task Options
 
@@ -335,6 +356,7 @@ All part files for each tile are merged and converted to COPC format. The pipeli
 **Options**:
 - **Default (preserve all dimensions)**: Keeps all point attributes (PredInstance, species_id, etc.)
 - **XYZ-only**: Set `--skip-dimension-reduction false` to reduce to X, Y, Z only (useful for raw pre-segmentation data)
+- **Chunkwise source COPC creation**: Set `--chunkwise-copc-source-creation` to stream source LAZ/LAS into temporary LAS parts before building the final COPC. This lowers peak RAM during source normalization but uses more temporary disk.
 
 ### Stage 4-5: Multi-Resolution Subsampling
 
@@ -543,6 +565,58 @@ Tile A (east border)         Tile B (west border)
 
 ---
 
+### Stage 8: Enrichment with Original Dimensions (Optional)
+
+**What it does**: Adds dimensions from the original input files (e.g. Amplitude, Reflectance, Deviation, NumberOfReturns) to the merged LAZ file. This is useful when the segmentation pipeline only operated on XYZ coordinates but you want the final output to include all original sensor attributes.
+
+**Enabled by**: `--transfer-original-dims-to-merged True` (default: `True`). Set to `False` to skip enrichment entirely.
+
+**How it works** (v3 streaming architecture):
+
+1. **Header scan**: Read the merged file header for point count, existing dimensions, and bounding box.
+2. **Dimension detection**: Read a single point from each original file to discover available dimensions. Cross-reference with the standardization JSON (`--standardization-json`) to determine which dimensions to transfer. Dimensions with zero variance across the entire collection (e.g. R, G, B when all zeros) are automatically skipped.
+3. **Pre-compute original bounding boxes**: Read each original file's header to get its spatial extent.
+4. **Streaming enrichment loop**:
+   - Stream the merged file in chunks (2M points per chunk).
+   - For each chunk, determine which original files spatially overlap using bounding box checks.
+   - Load overlapping originals into an LRU cache (max 3 files). Each cached entry holds a cKDTree + the dimension arrays to transfer.
+   - For each overlapping original, query the KDTree for nearest-neighbor matches and transfer dimension values.
+   - Write the enriched chunk immediately to the output file.
+5. **Output**: `merged_with_originals_dims.laz` in the output folder.
+
+**COPC support**: When original files are in COPC format (`.copc.laz`), the cache loads only the spatial subset overlapping the current chunk using PDAL's `readers.copc` with bounds filtering. This dramatically reduces memory usage for large original files.
+
+**Standardization JSON filtering**: If `--standardization-json` is provided, the pipeline reads `global_attribute_stats` from the JSON. Dimensions with `variance == 0` (constant across all tiles) are automatically excluded. This prevents transferring useless dimensions like all-zero RGB values.
+
+**Memory profile**: Peak RAM equals the LRU cache (2-3 original files with their KDTrees, typically 5-20 GB) plus one merged chunk (~48 MB). No memmaps or temp files are created.
+
+---
+
+## Memory Profile
+
+All pipeline steps are designed to be **fully streaming** — no step loads an entire dataset into RAM. This allows processing datasets of 100 GB+ on machines with limited memory.
+
+### Merge Task Memory Profile
+
+| Phase | Peak RAM | What's in RAM |
+|-------|----------|---------------|
+| **Phase A** (metadata extraction) | ~200 MB per worker | One chunk per worker (1M points). Metadata accumulators per instance (centroids, bboxes). Full point arrays discarded after extraction. |
+| **Phase B** (global matching) | ~50-100 MB | Metadata only: instance centroids, spatial hashes, KDTree. No point arrays. |
+| **Phase B.5** (hull computation) | ~50 MB | Incremental per-file: loads one file at a time, computes intermediate convex hulls, discards raw points. Only hull vertices retained. |
+| **Phase C** (streaming write) | ~50 MB | One chunk at a time (1M points). Running centroid sums and bounding boxes per instance (lightweight dicts). |
+| **Stage 6** (retile) | ~1-5 GB per tile | Streams merged file in chunks, spatial filter per tile using bounds check (no KDTree of merged needed). One tile written at a time. |
+| **Stage 7** (remap to originals) | ~1-5 GB per file | Same streaming approach as Stage 6. One original file processed at a time. |
+| **Stage 8** (enrichment) | ~5-20 GB | LRU cache of 2-3 original files (KDTree + dim arrays). One merged chunk (~48 MB). With COPC originals: only spatial subsets loaded, reducing to ~2-10 GB. |
+
+### Controlling Memory Usage
+
+- **`--workers`**: Controls parallel processing. Each worker loads one tile/file. Reduce to 1-2 on memory-constrained systems.
+- **`--transfer-original-dims-to-merged False`**: Skip enrichment entirely (saves the most memory in post-processing).
+- **COPC original files**: Using `.copc.laz` files for `--original-input-dir` enables spatial subset loading during enrichment, reducing peak RAM from ~20 GB to ~2-10 GB per cached file.
+- **`--chunk-size`**: Controls points per chunk during tiling Phase 1 (smaller = less peak RAM per worker).
+
+---
+
 ## Parameters Reference
 
 ### Tile Task Parameters
@@ -556,7 +630,8 @@ Tile A (east border)         Tile B (west border)
 | `--resolution-1` | 0.01 | First subsampling resolution (1cm) |
 | `--resolution-2` | 0.1 | Second subsampling resolution (10cm) |
 | `--skip-dimension-reduction` | False | Skip XYZ-only reduction, keep all point dimensions |
-| `--chunk-size` | 20000000 | Points per chunk when reading LAZ/LAS in Phase 1 (smaller = less peak RAM) |
+| `--chunk-size` | 20000000 | Points per chunk when reading LAZ/LAS in Phase 1, and for chunkwise source COPC creation when enabled |
+| `--chunkwise-copc-source-creation` | False | Stream source files into temporary LAS parts before final COPC creation |
 | `--tiling-threshold` | None | File size threshold in MB for skipping tiling on single small files |
 
 ### Merge Task Parameters

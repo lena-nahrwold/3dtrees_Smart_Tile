@@ -30,7 +30,7 @@ class Parameters(BaseSettings):
     
     task: str = Field(
         "tile",
-        description="Task to perform: 'tile' (tiling + subsampling), 'merge' (remap + merge), or 'remap' (merged file -> original files)",
+        description="Task to perform: 'tile' (tiling + subsampling), 'merge' (remap + merge), 'remap' (merged file -> original files), 'filter' (remove buffer-zone instances per tile, optional small-instance redistribution), or 'filter_remap' (filter then remap to original files, optional merged output)",
     )
     
     input_dir: Optional[Path] = Field(
@@ -111,8 +111,21 @@ class Parameters(BaseSettings):
 
     chunk_size: Optional[int] = Field(
         default=20_000_000,
-        description="Points per chunk when reading LAZ/LAS in tiling Phase 1 (smaller = less peak RAM, more overhead; only for 'tile' task)",
+        description="Points per chunk when reading LAZ/LAS in tiling Phase 1, and also for "
+                    "chunkwise source COPC creation when that mode is enabled "
+                    "(smaller = less peak RAM, more overhead; only for 'tile' task)",
         validation_alias=AliasChoices("chunk-size", "chunk_size"),
+    )
+
+    chunkwise_copc_source_creation: bool = Field(
+        default=False,
+        description="Stream source LAZ/LAS files into temporary LAS parts before final COPC creation. "
+                    "Reduces peak RAM during source normalization, but uses more temporary disk space "
+                    "and extra I/O (only for 'tile' task).",
+        validation_alias=AliasChoices(
+            "chunkwise-copc-source-creation",
+            "chunkwise_copc_source_creation",
+        ),
     )
 
     # ==========================================================================
@@ -207,6 +220,24 @@ class Parameters(BaseSettings):
         validation_alias=AliasChoices("threedtrees-suffix", "threedtrees_suffix"),
     )
 
+    standardization_json: Optional[Path] = Field(
+        default=None,
+        description="Path to collection_summary.json from tool_standard. "
+                    "When provided, only dimensions listed in "
+                    "collection.reference_attribute_names (minus X,Y,Z) "
+                    "are transferred from originals to the merged file, "
+                    "overwriting any existing merged values.",
+        validation_alias=AliasChoices("standardization-json", "standardization_json"),
+    )
+
+    merge_chunk_size: int = Field(
+        default=2_000_000,
+        description="Points per streaming chunk in merge pipeline. "
+                    "Controls memory vs speed for all merge I/O (remap, enrichment, retiling). "
+                    "Larger = faster but more RAM. Remap uses 3x this value.",
+        validation_alias=AliasChoices("merge-chunk-size", "merge_chunk_size"),
+    )
+
     # ==========================================================================
     # Remap task parameters
     # ==========================================================================
@@ -224,11 +255,6 @@ class Parameters(BaseSettings):
     )
 
     # Merge algorithm parameters
-    buffer: Optional[float] = Field(
-        10.0,
-        description="Buffer distance for filtering in meters (for 'merge' task)",
-    )
-    
     overlap_threshold: Optional[float] = Field(
         0.3,
         description="Overlap ratio threshold for instance matching (0.3 = 30%)",
@@ -242,17 +268,46 @@ class Parameters(BaseSettings):
     )
     
     max_volume_for_merge: Optional[float] = Field(
-        4.0,
-        description="Max convex hull volume for small instance merging in m³",
+        5.0,
+        description="Max 3D convex hull volume for small instance reassignment in m³",
         validation_alias=AliasChoices("max-volume-for-merge", "max_volume_for_merge"),
     )
     
     border_zone_width: Optional[float] = Field(
         10.0,
-        description="Width of border zone beyond buffer for instance matching (meters)",
+        description="Width of border zone inward from core boundary for instance matching (meters)",
         validation_alias=AliasChoices("border-zone-width", "border_zone_width"),
     )
-    
+
+    filter_anchor: str = Field(
+        "centroid",
+        description="For 'filter' task: which point of each instance is checked against the buffer zone. "
+                    "Options: 'centroid' (default), 'highest_point', 'lowest_point'.",
+        validation_alias=AliasChoices("filter-anchor", "filter_anchor"),
+    )
+
+    segmented_folders: str = Field(
+        "",
+        description="Comma-separated list of segmented tile folders (for filter_remap and remap tasks). "
+                    "All extra dimensions from each folder are copied as-is to output files. "
+                    "Dimensions with the same name across collections are suffixed _2, _3, etc.",
+        validation_alias=AliasChoices("segmented-folders", "segmented_folders"),
+    )
+
+    produce_merged_file: bool = Field(
+        False,
+        description="For filter_remap task: also write a single merged.laz (and merged_with_originals.laz) "
+                    "containing all points with original and segmentation dimensions combined.",
+        validation_alias=AliasChoices("produce-merged-file", "produce_merged_file"),
+    )
+
+    remap_dims: Optional[str] = Field(
+        None,
+        description="Comma-separated extra dimension names to transfer during remap "
+                    "(e.g. 'PredInstance,PredSemantic'). Default: all extra dims from the collection files.",
+        validation_alias=AliasChoices("remap-dims", "remap_dims"),
+    )
+
     min_cluster_size: Optional[int] = Field(
         300,
         description="Minimum cluster size in points for reassignment",
@@ -276,7 +331,13 @@ class Parameters(BaseSettings):
         description="Skip creating merged LAZ file (only create retiled outputs)",
         validation_alias=AliasChoices("skip-merged-file", "skip_merged_file"),
     )
-    
+
+    save_filtered_tiles: bool = Field(
+        False,
+        description="Save filtered tiles (with buffer-zone instances removed) for debugging",
+        validation_alias=AliasChoices("save-filtered-tiles", "save_filtered_tiles"),
+    )
+
     verbose: bool = Field(
         False,
         description="Print detailed merge decisions",
@@ -285,7 +346,7 @@ class Parameters(BaseSettings):
     # ==========================================================================
     # Validators
     # ==========================================================================
-    
+
     @field_validator(
         "input_dir",
         "output_dir",
@@ -313,7 +374,6 @@ class Parameters(BaseSettings):
         return v
     
     @field_validator(
-        "buffer",
         "overlap_threshold",
         "max_centroid_distance",
         "max_volume_for_merge",
@@ -372,6 +432,7 @@ def print_params(params: Parameters):
     print(f"  tile_buffer: {params.tile_buffer}")
     print(f"  threads: {params.threads}")
     print(f"  chunk_size: {params.chunk_size}")
+    print(f"  chunkwise_copc_source_creation: {params.chunkwise_copc_source_creation}")
     print(f"  resolution_1: {params.resolution_1}")
     print(f"  resolution_2: {params.resolution_2}")
     print(f"  skip_dimension_reduction: {params.skip_dimension_reduction}")
@@ -379,12 +440,13 @@ def print_params(params: Parameters):
     print("\nMerge Task:")
     print(f"  subsampled_10cm_folder: {params.subsampled_10cm_folder}")
     print(f"  original_input_dir: {params.original_input_dir}")
-    print(f"  buffer: {params.buffer}")
     print(f"  overlap_threshold: {params.overlap_threshold}")
     print(f"  max_centroid_distance: {params.max_centroid_distance}")
     print(f"  max_volume_for_merge: {params.max_volume_for_merge}")
     print(f"  min_cluster_size: {params.min_cluster_size}")
     print(f"  disable_matching: {params.disable_matching}")
+    print(f"  standardization_json: {params.standardization_json}")
+    print(f"  merge_chunk_size: {params.merge_chunk_size:,}")
     print(f"  verbose: {params.verbose}")
     
     print("=" * 60)
@@ -402,13 +464,13 @@ def get_tile_params(params: Parameters) -> dict:
         'resolution_2': params.resolution_2,
         'skip_dimension_reduction': params.skip_dimension_reduction,
         'chunk_size': params.chunk_size,
+        'chunkwise_copc_source_creation': params.chunkwise_copc_source_creation,
     }
 
 
 def get_merge_params(params: Parameters) -> dict:
     """Get merge parameters as a dictionary for legacy compatibility."""
     return {
-        'buffer': params.buffer,
         'overlap_threshold': params.overlap_threshold,
         'max_centroid_distance': params.max_centroid_distance,
         'max_volume_for_merge': params.max_volume_for_merge,
@@ -416,6 +478,8 @@ def get_merge_params(params: Parameters) -> dict:
         'workers': params.workers,
         'verbose': params.verbose,
         'instance_dimension': params.instance_dimension,
+        'standardization_json': params.standardization_json,
+        'merge_chunk_size': params.merge_chunk_size,
     }
 
 
@@ -437,6 +501,7 @@ TILE_PARAMS = {
     'resolution_2': 0.1,
     'skip_dimension_reduction': False,
     'chunk_size': 20_000_000,
+    'chunkwise_copc_source_creation': False,
 }
 
 REMAP_PARAMS = {
@@ -445,14 +510,14 @@ REMAP_PARAMS = {
 }
 
 MERGE_PARAMS = {
-    'buffer': 10.0,
     'overlap_threshold': 0.3,
     'max_centroid_distance': 3.0,
-    'max_volume_for_merge': 4.0,
+    'max_volume_for_merge': 5.0,
     'min_cluster_size': 300,
     'workers': 4,
     'verbose': True,
     'retile_buffer': 2.0,  # Fixed to 2.0m
+    'merge_chunk_size': 2_000_000,
 }
 
 

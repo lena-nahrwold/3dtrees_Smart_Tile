@@ -141,6 +141,7 @@ def build_tiles(minx, miny, maxx, maxy, length, buffer, align_to_grid=False, gri
                     "col": col,
                     "row": row,
                     "core": [core_x, core_y],
+                    "planned_bounds": [buffered_x, buffered_y],
                     "bounds": [buffered_x, buffered_y],
                 }
             )

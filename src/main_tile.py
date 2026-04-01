@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-Main tiling script: index building and tiling from LAZ/LAS input.
+Main tiling script: COPC-first source preparation, indexing, and tiling.
 
 This script handles the first phase of the 3DTrees pipeline:
-1. Build spatial index (tindex) from input LAZ/LAS files
-2. Calculate tile bounds
-3. Create overlapping tiles (laspy crop, COPC conversion via PDAL or untwine)
+1. Normalize source LAZ/LAS files to COPC while preserving all dimensions
+2. Build a spatial index (tindex) from the COPC sources
+3. Calculate tile bounds
+4. Create overlapping COPC tiles
 
-Uses laspy for Phase 1 (distribute/crop) and PDAL or untwine for Phase 2 (COPC).
+Uses COPC-aware reads where helpful during tile creation and keeps all source
+dimensions intact until the later subsampling stage decides what to retain.
 
 Usage:
     python main_tile.py --input_dir /path/to/input --output_dir /path/to/output
@@ -22,7 +24,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import plot_tiles_and_copc
@@ -47,6 +49,18 @@ def get_pdal_wrench_path() -> str:
     return wrench_path if wrench_path else "pdal_wrench"
 
 
+def get_untwine_path(require: bool = False) -> Optional[str]:
+    """Get the path to untwine, optionally failing if it is unavailable."""
+    untwine_path = shutil.which("untwine")
+    if untwine_path:
+        return untwine_path
+    if require:
+        raise RuntimeError(
+            "untwine is required for the COPC-first tiling pipeline but was not found in PATH"
+        )
+    return None
+
+
 def _laspy_laz_backend():
     """Return the LAZ backend to use for laspy (Lazrs or LazrsParallel when available)."""
     try:
@@ -60,15 +74,46 @@ def _laspy_laz_backend():
     return None
 
 
+def list_point_cloud_files(input_dir: Path, include_copc: bool = True) -> List[Path]:
+    """List point cloud files in a directory, optionally including COPC."""
+    files = sorted(list(input_dir.glob("*.las")) + list(input_dir.glob("*.laz")))
+    if include_copc:
+        return files
+    return [f for f in files if not f.name.endswith(".copc.laz")]
+
+
+def _copc_name_for_source(source_file: Path) -> str:
+    """Return the canonical COPC filename for a source point cloud."""
+    if source_file.name.endswith(".copc.laz"):
+        return source_file.name
+    return f"{source_file.stem}.copc.laz"
+
+
+def _format_pdal_bounds(bounds: Tuple[float, float, float, float]) -> str:
+    """Format bounds for PDAL readers.copc."""
+    xmin, ymin, xmax, ymax = bounds
+    return f"([{xmin},{xmax}],[{ymin},{ymax}])"
+
+
+def _union_bounds(bounds_list: List[Tuple[float, float, float, float]]) -> Tuple[float, float, float, float]:
+    """Return the union bbox for a list of bounds."""
+    return (
+        min(b[0] for b in bounds_list),
+        min(b[1] for b in bounds_list),
+        max(b[2] for b in bounds_list),
+        max(b[3] for b in bounds_list),
+    )
+
+
 def build_tindex(input_dir: Path, output_gpkg: Path) -> Path:
     """
-    Build spatial index (tindex) from LAZ/LAS files.
+    Build spatial index (tindex) from point cloud files.
 
     Uses pdal tindex to create a GeoPackage containing the spatial
     extents of all point cloud files for efficient spatial queries.
 
     Args:
-        input_dir: Directory containing input LAZ/LAS files
+        input_dir: Directory containing input point cloud files
         output_gpkg: Output path for tindex GeoPackage
 
     Returns:
@@ -76,7 +121,7 @@ def build_tindex(input_dir: Path, output_gpkg: Path) -> Path:
     """
     print()
     print("=" * 60)
-    print("Step 1: Building spatial index (tindex)")
+    print("Building spatial index (tindex)")
     print("=" * 60)
 
     # Check if tindex already exists
@@ -87,13 +132,10 @@ def build_tindex(input_dir: Path, output_gpkg: Path) -> Path:
     # Create output directory
     output_gpkg.parent.mkdir(parents=True, exist_ok=True)
 
-    # Find LAZ and LAS files (exclude .copc.laz)
-    source_files = sorted(
-        list(input_dir.glob("*.laz")) + list(input_dir.glob("*.las"))
-    )
-    source_files = [f for f in source_files if not f.name.endswith(".copc.laz")]
+    # Find LAZ/LAS/COPC source files.
+    source_files = list_point_cloud_files(input_dir, include_copc=True)
     if not source_files:
-        raise ValueError(f"No LAZ/LAS files found in {input_dir}")
+        raise ValueError(f"No point cloud files found in {input_dir}")
 
     # Try to get SRS from the first file to avoid default EPSG:4326 in tindex
     tindex_srs = None
@@ -179,7 +221,7 @@ def calculate_tile_bounds(
     """
     print()
     print("=" * 60)
-    print("Step 2: Calculating tile bounds")
+    print("Calculating tile bounds")
     print("=" * 60)
     
     script_dir = Path(__file__).parent
@@ -228,9 +270,9 @@ def update_tile_bounds_json_from_files(
     file_glob: str = "*.laz",
 ) -> int:
     """
-    Update tile_bounds_tindex.json so each tile's bounds match the actual
-    file header bounds from the created tiles (e.g. subsampled LAZ).
-    This keeps the JSON in sync with real data extent for remap/merge matching.
+    Update tile_bounds_tindex.json with the actual file header bounds from the
+    created tiles (e.g. subsampled LAZ), while preserving the planned tiling
+    geometry used for ownership and neighbor logic.
 
     Matches tiles by label c{col:02d}_r{row:02d} (e.g. c00_r00) to filenames
     that start with that label (e.g. c00_r00_subsampled_1cm.laz).
@@ -271,7 +313,9 @@ def update_tile_bounds_json_from_files(
         if bounds is None:
             continue
         minx, maxx, miny, maxy = bounds
-        tile["bounds"] = [[minx, maxx], [miny, maxy]]
+        if "planned_bounds" not in tile and "bounds" in tile:
+            tile["planned_bounds"] = tile["bounds"]
+        tile["actual_bounds"] = [[minx, maxx], [miny, maxy]]
         updated += 1
 
     if updated > 0:
@@ -507,7 +551,58 @@ def _crop_with_laspy(
         return (False, 0, str(e))
 
 
-def _distribute_source_file(args: Tuple) -> List[Tuple[str, int]]:
+def _materialize_copc_subset(
+    src_file: str,
+    bounds: Tuple[float, float, float, float],
+    label: str,
+) -> Tuple[Optional[Path], str]:
+    """Materialize a spatial COPC subset to a temporary LAS for local chunked processing."""
+    pdal_cmd = get_pdal_path()
+    tmp_fd, tmp_name = tempfile.mkstemp(prefix=f"{label}_subset_", suffix=".las")
+    os.close(tmp_fd)
+    subset_path = Path(tmp_name)
+
+    pipeline = {
+        "pipeline": [
+            {
+                "type": "readers.copc",
+                "filename": str(src_file),
+                "bounds": _format_pdal_bounds(bounds),
+            },
+            {
+                "type": "writers.las",
+                "filename": str(subset_path),
+                "forward": "all",
+                "extra_dims": "all",
+            },
+        ]
+    }
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(pipeline, f)
+        pipeline_file = Path(f.name)
+
+    try:
+        result = subprocess.run(
+            [pdal_cmd, "pipeline", str(pipeline_file)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            if subset_path.exists():
+                subset_path.unlink()
+            stderr = (result.stderr or result.stdout or "unknown error").strip()
+            return (None, stderr[:200])
+        if not subset_path.exists() or subset_path.stat().st_size == 0:
+            return (None, "subset pipeline produced no output")
+        return (subset_path, "OK")
+    finally:
+        if pipeline_file.exists():
+            pipeline_file.unlink()
+
+
+def _distribute_source_file(args: Tuple) -> Tuple[List[Tuple[str, int]], str]:
     """
     Phase 1: Read one source file (chunked) and write cropped parts for all
     overlapping tiles.
@@ -527,7 +622,9 @@ def _distribute_source_file(args: Tuple) -> List[Tuple[str, int]]:
               chunk_size: points per chunk (smaller = less peak RAM, more overhead)
 
     Returns:
-        list of (tile_label, point_count) for tiles that received points
+        Tuple of:
+        - list of (tile_label, point_count) for tiles that received points
+        - description of how the source was read
     """
     import laspy
     import numpy as np
@@ -539,12 +636,27 @@ def _distribute_source_file(args: Tuple) -> List[Tuple[str, int]]:
         os.environ["RAYON_NUM_THREADS"] = str(decompress_threads)
 
     if not os.path.isfile(src_file):
-        return []
+        return ([], "missing source file")
 
     try:
+        stream_file = src_file
+        temp_subset_path: Optional[Path] = None
+        read_mode = "full scan"
+
+        if src_file.lower().endswith(".copc.laz") and overlapping_tiles:
+            query_bounds = _union_bounds([bounds for _, bounds in overlapping_tiles])
+            temp_subset_path, subset_message = _materialize_copc_subset(
+                src_file, query_bounds, f"src{source_idx}"
+            )
+            if temp_subset_path is not None:
+                stream_file = str(temp_subset_path)
+                read_mode = f"COPC subset {query_bounds}"
+            else:
+                read_mode = f"COPC fallback full scan ({subset_message})"
+
         laz_backend = _laspy_laz_backend()
         open_kwargs = {}
-        if src_file.lower().endswith(".laz") and laz_backend is not None:
+        if stream_file.lower().endswith(".laz") and laz_backend is not None:
             open_kwargs["laz_backend"] = laz_backend
 
         # --- stream through the file in chunks --------------------------------
@@ -562,7 +674,7 @@ def _distribute_source_file(args: Tuple) -> List[Tuple[str, int]]:
 
         header_snapshot = None  # will be captured from the first chunk
 
-        with laspy.open(src_file, **open_kwargs) as reader:
+        with laspy.open(stream_file, **open_kwargs) as reader:
             header_snapshot = reader.header
 
             for chunk in reader.chunk_iterator(chunk_size):
@@ -584,7 +696,7 @@ def _distribute_source_file(args: Tuple) -> List[Tuple[str, int]]:
                     tile_counts[label] += cnt
 
         if header_snapshot is None:
-            return []
+            return ([], read_mode)
 
         # --- write one part file per tile that received points -----------------
         # Keep intermediate parts uncompressed so Phase 1 avoids repeated LAZ
@@ -629,18 +741,21 @@ def _distribute_source_file(args: Tuple) -> List[Tuple[str, int]]:
 
             results.append((label, tile_counts[label]))
 
-        return results
+        return (results, read_mode)
 
     except Exception as e:
         print(f"    ⚠ Error processing {Path(src_file).name}: {e}")
-        return []
+        return ([], f"error: {e}")
+    finally:
+        if 'temp_subset_path' in locals() and temp_subset_path is not None and temp_subset_path.exists():
+            temp_subset_path.unlink()
 
 
 def _finalize_tile_to_copc(args: Tuple) -> Tuple[str, bool, str]:
     """
     Phase 2: Merge a tile's LAZ part files into a single COPC tile.
 
-    Tries untwine first (fast), falls back to PDAL if unavailable.
+    Uses untwine for COPC generation.
 
     Args:
         args: (label, tiles_dir, log_dir, tile_bounds)
@@ -668,7 +783,6 @@ def _finalize_tile_to_copc(args: Tuple) -> Tuple[str, bool, str]:
         return (label, True, "No data in bounds")
 
     try:
-        # Try untwine first (fast), fall back to PDAL
         success, message = _finalize_tile_to_copc_untwine(parts, final_tile, log_dir, label)
 
         if not success:
@@ -758,13 +872,10 @@ def _finalize_tile_to_copc_untwine(
     For multiple parts, passes all files directly to untwine (it supports
     multiple input files natively).
     """
-    untwine_cmd = shutil.which("untwine")
-    if not untwine_cmd:
-        # Fallback to PDAL if untwine is not installed
-        success, msg = _finalize_tile_to_copc_pdal(parts, final_tile, log_dir, label)
-        if success:
-            return (True, "pdal")
-        return (False, msg)
+    try:
+        untwine_cmd = get_untwine_path(require=True)
+    except RuntimeError as e:
+        return (False, str(e))
 
     try:
         input_args = []
@@ -788,24 +899,223 @@ def _finalize_tile_to_copc_untwine(
         return (False, f"untwine error: {e}")
 
 
-def _convert_laz_to_copc(input_laz: Path, output_copc: Path) -> bool:
+def _stream_source_into_las_parts(
+    input_laz: Path,
+    parts_dir: Path,
+    chunk_size: int,
+) -> Tuple[bool, List[Path], str]:
+    """Split one source file into temporary LAS parts using chunked laspy reads."""
+    import laspy
+
+    laz_backend = _laspy_laz_backend()
+    open_kwargs = {}
+    if input_laz.suffix.lower() == ".laz" and laz_backend is not None:
+        open_kwargs["laz_backend"] = laz_backend
+
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    part_paths: List[Path] = []
+
+    try:
+        with laspy.open(str(input_laz), **open_kwargs) as reader:
+            for chunk_idx, chunk in enumerate(reader.chunk_iterator(chunk_size)):
+                if len(chunk) == 0:
+                    continue
+                part_path = parts_dir / f"part_{chunk_idx:05d}.las"
+                part_header = _make_tile_header(reader.header)
+                with laspy.open(str(part_path), mode="w", header=part_header) as writer:
+                    writer.write_points(chunk)
+                part_paths.append(part_path)
+    except Exception as e:
+        return (False, [], str(e))
+
+    if not part_paths:
+        return (False, [], "no points were written to temporary LAS parts")
+
+    return (True, part_paths, f"{len(part_paths)} part(s)")
+
+
+def _convert_laz_to_copc_direct(input_laz: Path, output_copc: Path) -> Tuple[bool, str]:
+    """Convert a single LAZ/LAS file to COPC via a direct untwine call.
+
+    Uses untwine so the tiling pipeline has one consistent COPC writer.
+    """
+    untwine_cmd = get_untwine_path(require=True)
+    try:
+        r = subprocess.run(
+            [untwine_cmd, "-i", str(input_laz), "-o", str(output_copc)],
+            capture_output=True, text=True, check=False,
+        )
+        success = r.returncode == 0 and output_copc.exists() and output_copc.stat().st_size > 0
+        if success:
+            return (True, "untwine direct")
+        stderr = (r.stderr or r.stdout or "unknown error").strip()
+        return (False, stderr[:200] or "untwine direct conversion failed")
+    except Exception as e:
+        return (False, str(e))
+
+
+def _convert_laz_to_copc_chunked(
+    input_laz: Path,
+    output_copc: Path,
+    chunk_size: int,
+) -> Tuple[bool, str]:
+    """Convert a single LAZ/LAS file to COPC via temporary chunked LAS parts."""
+    temp_dir = Path(
+        tempfile.mkdtemp(
+            prefix=f"{output_copc.stem}_chunked_",
+            dir=str(output_copc.parent),
+        )
+    )
+    parts_dir = temp_dir / "parts"
+
+    try:
+        chunk_success, parts, chunk_message = _stream_source_into_las_parts(
+            input_laz=input_laz,
+            parts_dir=parts_dir,
+            chunk_size=chunk_size,
+        )
+        if not chunk_success:
+            return (False, f"chunk split failed: {chunk_message}")
+
+        copc_success, copc_message = _finalize_tile_to_copc_untwine(
+            parts=parts,
+            final_tile=output_copc,
+            log_dir=temp_dir,
+            label=input_laz.stem,
+        )
+        if not copc_success:
+            return (False, copc_message)
+
+        return (True, f"chunked laspy -> untwine ({chunk_message})")
+    except Exception as e:
+        return (False, str(e))
+    finally:
+        if not (output_copc.exists() and output_copc.stat().st_size > 0):
+            output_copc.unlink(missing_ok=True)
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def _convert_laz_to_copc(
+    input_laz: Path,
+    output_copc: Path,
+    chunk_size: int,
+    chunkwise_source_creation: bool = False,
+) -> Tuple[bool, str]:
     """Convert a single LAZ/LAS file to COPC.
 
-    Tries untwine first (fast), falls back to PDAL if unavailable.
+    When chunkwise_source_creation is enabled, the source is first streamed into
+    temporary LAS parts before untwine builds the final COPC. This trades disk
+    I/O for lower peak RAM during source normalization.
     """
-    untwine_cmd = shutil.which("untwine")
-    if untwine_cmd:
-        try:
-            r = subprocess.run(
-                [untwine_cmd, "-i", str(input_laz), "-o", str(output_copc)],
-                capture_output=True, text=True, check=False,
-            )
-            if r.returncode == 0 and output_copc.exists() and output_copc.stat().st_size > 0:
-                return True
-        except Exception:
-            pass
+    if chunkwise_source_creation:
+        return _convert_laz_to_copc_chunked(
+            input_laz=input_laz,
+            output_copc=output_copc,
+            chunk_size=chunk_size,
+        )
+    return _convert_laz_to_copc_direct(input_laz, output_copc)
 
-    return _convert_laz_to_copc_pdal(input_laz, output_copc)
+
+def ensure_copc_sources(
+    input_dir: Path,
+    copc_dir: Path,
+    max_workers: int = 4,
+    chunk_size: int = 20_000_000,
+    chunkwise_source_creation: bool = False,
+) -> Tuple[Path, List[Path], List[Path]]:
+    """
+    Normalize source inputs to COPC, preserving all dimensions.
+
+    Returns:
+        Tuple of:
+        - path to the original_copc directory
+        - original non-COPC source files discovered in input_dir
+        - COPC files available for downstream tiling/subsampling
+    """
+    original_sources = list_point_cloud_files(input_dir, include_copc=False)
+    existing_copc_inputs = sorted(input_dir.glob("*.copc.laz"))
+
+    if not original_sources and not existing_copc_inputs:
+        raise ValueError(f"No point cloud files found in {input_dir}")
+
+    copc_dir.mkdir(parents=True, exist_ok=True)
+
+    if not original_sources:
+        print()
+        print("=" * 60)
+        print("Step 1: Using existing COPC sources")
+        print("=" * 60)
+        for src in existing_copc_inputs:
+            dest = copc_dir / src.name
+            if dest.exists() and dest.stat().st_size > 0:
+                continue
+            shutil.copy2(src, dest)
+        copc_files = sorted(copc_dir.glob("*.copc.laz"))
+        print(f"  Reused {len(copc_files)} COPC file(s)")
+        return copc_dir, [], copc_files
+
+    print()
+    print("=" * 60)
+    print("Step 1: Converting source files to COPC")
+    print("=" * 60)
+    print("  All source dimensions are preserved during COPC conversion.")
+    if chunkwise_source_creation:
+        print(
+            "  COPC writer: chunked laspy staging -> untwine "
+            f"({chunk_size:,} pts/chunk)"
+        )
+    else:
+        print("  COPC writer: untwine")
+    print(f"  Input files: {len(original_sources)}")
+    print(f"  COPC directory: {copc_dir}")
+
+    tasks: List[Tuple[Path, Path]] = []
+    expected_outputs: List[Path] = []
+    reused = 0
+    for src in original_sources:
+        out_copc = copc_dir / _copc_name_for_source(src)
+        expected_outputs.append(out_copc)
+        if out_copc.exists() and out_copc.stat().st_size > 0:
+            reused += 1
+            continue
+        tasks.append((src, out_copc))
+
+    if reused:
+        print(f"  Reusing {reused} existing COPC file(s)")
+
+    if tasks:
+        worker_count = max(1, min(max_workers, len(tasks)))
+        print(f"  Converting {len(tasks)} file(s) with {worker_count} worker(s)")
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = {
+                executor.submit(
+                    _convert_laz_to_copc,
+                    src,
+                    out,
+                    chunk_size,
+                    chunkwise_source_creation,
+                ): (src, out)
+                for src, out in tasks
+            }
+            for future in as_completed(futures):
+                src, out = futures[future]
+                success, message = future.result()
+                if not success:
+                    raise RuntimeError(f"LAZ/LAS→COPC conversion failed: {src} ({message})")
+                print(f"    ✓ {src.name} -> {out.name} [{message}]")
+    else:
+        print("  All COPC sources already exist")
+
+    missing_outputs = [path for path in expected_outputs if not path.exists() or path.stat().st_size == 0]
+    if missing_outputs:
+        raise RuntimeError(
+            "Missing expected COPC file(s): "
+            + ", ".join(path.name for path in missing_outputs[:5])
+        )
+
+    total_size_gb = sum(f.stat().st_size for f in expected_outputs) / (1024 ** 3)
+    print(f"  ✓ COPC source preparation complete: {len(expected_outputs)} file(s), {total_size_gb:.2f} GB total")
+    return copc_dir, original_sources, expected_outputs
 
 
 def create_tiles(
@@ -818,15 +1128,14 @@ def create_tiles(
     chunk_size: int = 20_000_000,
 ) -> List[Path]:
     """
-    Create overlapping tiles from source LAZ/LAS files (two-phase).
+    Create overlapping tiles from source point cloud files (two-phase).
 
     Phase 1 – Distribute: each source file is read exactly once (in chunks)
     and cropped points are written as per-tile LAZ part files.  This avoids
     the previous O(sources × tiles) read pattern.
 
     Phase 2 – Finalise: each tile's part files are merged and converted to
-    COPC format (tries untwine, falls back to PDAL).  Fully parallelised
-    across tiles.
+    COPC format with untwine. Fully parallelised across tiles.
 
     Args:
         tindex_file: Path to tindex GeoPackage
@@ -842,7 +1151,7 @@ def create_tiles(
     """
     print()
     print("=" * 60)
-    print("Step 3: Creating tiles (two-phase)")
+    print("Creating tiles (two-phase)")
     print("=" * 60)
 
     # Create directories
@@ -920,14 +1229,14 @@ def create_tiles(
         for future in as_completed(futures):
             src_name = futures[future]
             try:
-                results = future.result()
+                results, read_mode = future.result()
                 for label, count in results:
                     tile_point_counts[label] = tile_point_counts.get(label, 0) + count
                 if results:
                     total_pts = sum(c for _, c in results)
-                    print(f"    ✓ {src_name}: {total_pts:,} pts → {len(results)} tile(s)")
+                    print(f"    ✓ {src_name}: {total_pts:,} pts → {len(results)} tile(s) [{read_mode}]")
                 else:
-                    print(f"    - {src_name}: no overlapping data")
+                    print(f"    - {src_name}: no overlapping data [{read_mode}]")
             except Exception as e:
                 print(f"    ✗ {src_name}: {e}")
 
@@ -1009,20 +1318,22 @@ def run_tiling_pipeline(
     num_workers: int = 4,
     threads: int = 5,
     max_tile_procs: int = 5,
-    dimension_reduction: bool = True,  # Ignored (kept for API compatibility)
+    dimension_reduction: bool = True,
     tiling_threshold: float = None,
     chunk_size: int = 2_000_000,
+    chunkwise_copc_source_creation: bool = False,
 ) -> Path:
     """
     Run the complete tiling pipeline.
 
     Steps:
-    1. Build spatial index (tindex) from input LAZ/LAS files
-    2. Calculate tile bounds
-    3. Create overlapping tiles (laspy crop, COPC conversion via untwine/PDAL)
+    1. Convert source LAZ/LAS inputs to COPC, preserving all dimensions
+    2. Build spatial index (tindex) from COPC source files
+    3. Calculate tile bounds
+    4. Create overlapping COPC tiles
 
-    If input folder contains a single file below tiling_threshold, converts it to
-    COPC and returns that directory for direct subsampling.
+    If input folder contains a single file below tiling_threshold, the already
+    converted COPC source is returned directly for subsampling.
 
     Args:
         input_dir: Directory containing input LAZ/LAS files
@@ -1030,59 +1341,81 @@ def run_tiling_pipeline(
         tile_length: Tile size in meters
         tile_buffer: Buffer overlap in meters
         grid_offset: Offset from min coordinates
-        num_workers: Unused (kept for API compatibility)
+        num_workers: Worker count used for source COPC conversion
         threads: Threads per PDAL writer
         max_tile_procs: Maximum parallel tile processes
-        dimension_reduction: Ignored (kept for API compatibility)
+        dimension_reduction:
+            Kept for API compatibility with the caller. COPC conversion always
+            preserves all dimensions; dimension reduction only applies later in
+            the subsampling stage.
         tiling_threshold: File size threshold in MB. If single file below this, skip tiling
-        chunk_size: Points per chunk when reading LAZ/LAS in Phase 1 (smaller = less peak RAM)
+        chunk_size: Points per chunk when reading source data in Phase 1 (smaller = less peak RAM)
 
     Returns:
         Path to tiles directory (or copc_single directory if tiling was skipped)
     """
     print("=" * 60)
-    print("3DTrees Tiling Pipeline (laspy + PDAL)")
+    print("3DTrees Tiling Pipeline (COPC-first)")
     print("=" * 60)
+    untwine_cmd = get_untwine_path(require=True)
     print(f"Input: {input_dir}")
     print(f"Output: {output_dir}")
     print(f"Tile size: {tile_length}m with {tile_buffer}m buffer")
+    print("Source normalization: COPC with all dimensions preserved")
+    print(f"COPC writer: untwine ({untwine_cmd})")
+    print(
+        "Subsampling dimension policy: "
+        f"{'standard dims only later' if dimension_reduction else 'keep all dims later'}"
+    )
+    print(
+        "Source COPC conversion: "
+        + (
+            f"chunkwise staging enabled ({chunk_size:,} pts/chunk)"
+            if chunkwise_copc_source_creation
+            else "direct untwine"
+        )
+    )
     print()
 
     tiles_dir = output_dir / f"tiles_{int(tile_length)}m"
+    source_copc_dir = output_dir / "original_copc"
     log_dir = output_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     tindex_file = output_dir / f"tindex_{int(tile_length)}m.gpkg"
 
     # Check if we should skip tiling (single small file)
     should_skip_tiling = False
+    input_source_files = list_point_cloud_files(input_dir, include_copc=False)
+    if not input_source_files:
+        input_source_files = sorted(input_dir.glob("*.copc.laz"))
     if tiling_threshold is not None:
-        input_files = list(input_dir.glob("*.laz")) + list(input_dir.glob("*.las"))
-        input_files = [f for f in input_files if not f.name.endswith(".copc.laz")]
-
-        if len(input_files) == 1:
-            original_size_mb = input_files[0].stat().st_size / (1024 * 1024)
+        if len(input_source_files) == 1:
+            original_size_mb = input_source_files[0].stat().st_size / (1024 * 1024)
             if original_size_mb < tiling_threshold:
                 should_skip_tiling = True
                 print("=" * 60)
                 print("Tiling Threshold Check")
                 print("=" * 60)
-                print(f"  Single file detected: {input_files[0].name}")
+                print(f"  Single file detected: {input_source_files[0].name}")
                 print(f"  Original file size: {original_size_mb:.2f} MB")
                 print(f"  Threshold: {tiling_threshold} MB")
-                print(f"  Decision: Will skip tiling, convert to COPC with PDAL")
+                print("  Decision: Will skip tile generation after COPC normalization")
                 print("=" * 60)
                 print()
 
-    # Validate input
-    source_files = list(input_dir.glob("*.laz")) + list(input_dir.glob("*.las"))
-    source_files = [f for f in source_files if not f.name.endswith(".copc.laz")]
-    if not source_files:
-        raise ValueError(f"No LAZ/LAS files found in {input_dir}")
+    # Step 1: Normalize input sources to COPC so downstream steps can use COPC-aware reads.
+    source_copc_dir, original_sources, copc_sources = ensure_copc_sources(
+        input_dir=input_dir,
+        copc_dir=source_copc_dir,
+        max_workers=num_workers,
+        chunk_size=chunk_size,
+        chunkwise_source_creation=chunkwise_copc_source_creation,
+    )
 
-    # Step 1: Build tindex from input LAZ/LAS
-    tindex_file = build_tindex(input_dir, tindex_file)
+    # Step 2: Build tindex from COPC source files
+    tindex_file = build_tindex(source_copc_dir, tindex_file)
 
-    # Step 2: Calculate tile bounds
+    # Step 3: Calculate tile bounds
     jobs_file, bounds_json, env = calculate_tile_bounds(
         tindex_file, tile_length, tile_buffer, output_dir, grid_offset
     )
@@ -1099,29 +1432,28 @@ def run_tiling_pipeline(
         tindex_file, bounds_json, output_dir / "overview_copc_tiles.png"
     )
 
-    # Check if we should skip tiling (single small file)
-    # Done AFTER tindex/bounds/plot so those outputs are always available for merge
+    # Check if we should skip tiling.
+    # Done AFTER tindex/bounds/plot so those outputs are always available for merge.
     if should_skip_tiling:
         print()
         print("=" * 60)
         print("Skipping Tiling (Single Small File)")
         print("=" * 60)
-        laz_file = [f for f in source_files if not f.name.endswith(".copc.laz")][0]
         copc_single_dir = output_dir / "copc_single"
         copc_single_dir.mkdir(parents=True, exist_ok=True)
-        out_copc = copc_single_dir / f"{laz_file.stem}.copc.laz"
+        source_copc = copc_sources[0]
+        out_copc = copc_single_dir / source_copc.name
         if not out_copc.exists() or out_copc.stat().st_size == 0:
-            print("  Converting LAZ to COPC...")
-            if not _convert_laz_to_copc(laz_file, out_copc):
-                raise RuntimeError(f"LAZ→COPC conversion failed: {laz_file}")
-            print(f"  ✓ Created {out_copc.name}")
+            print("  Reusing normalized COPC source...")
+            shutil.copy2(source_copc, out_copc)
+            print(f"  ✓ Prepared {out_copc.name}")
         else:
             print(f"  Using existing {out_copc.name}")
         print(f"  Returning COPC directory for direct subsampling")
         print("=" * 60)
         return copc_single_dir
 
-    # Step 3: Create tiles
+    # Step 4: Create tiles from the COPC source tindex
     tile_files = create_tiles(
         tindex_file,
         jobs_file,
@@ -1136,7 +1468,8 @@ def run_tiling_pipeline(
     print("=" * 60)
     print("Tiling Pipeline Complete")
     print("=" * 60)
-    print(f"  Source files: {len(source_files)}")
+    print(f"  Original source files: {len(original_sources) if original_sources else len(copc_sources)}")
+    print(f"  COPC source files: {len(copc_sources)}")
     print(f"  Tiles created: {len(tile_files)}")
     print(f"  Tiles directory: {tiles_dir}")
 
@@ -1146,7 +1479,7 @@ def run_tiling_pipeline(
 def main():
     """CLI entry point."""
     parser = argparse.ArgumentParser(
-        description="3DTrees Tiling Pipeline - laspy + PDAL tiling from LAZ/LAS input",
+        description="3DTrees Tiling Pipeline - COPC-first tiling from LAZ/LAS input",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     
@@ -1154,7 +1487,7 @@ def main():
         "--input_dir", "-i",
         type=Path,
         required=True,
-        help="Input directory containing LAZ files"
+        help="Input directory containing LAZ/LAS files"
     )
     
     parser.add_argument(

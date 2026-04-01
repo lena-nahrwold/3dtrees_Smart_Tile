@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -27,6 +28,7 @@ from scipy.spatial import cKDTree
 # For JSON-based file matching (same grid as merge)
 from merge_tiles import (
     build_neighbor_graph_from_bounds_json,
+    normalize_tile_id,
     _match_tiles_to_json_bounds,
     extra_bytes_params_from_dimension_info,
 )  
@@ -188,18 +190,26 @@ def bounds_match(
     return iou >= 30.0
 
 
+_REMAP_CHUNK_SIZE = 5_000_000  # points per target chunk during streaming remap
+
+
 def remap_single_tile(
     segmented_file: Path,
     target_file: Path,
     output_file: Path,
     threedtrees_dims: Optional[Set[str]] = None,
     threedtrees_suffix: str = "SAT",
+    chunk_size: int = _REMAP_CHUNK_SIZE,
 ) -> Tuple[str, bool, str, int]:
     """
     Remap predictions from segmented file to target resolution file.
 
     Uses KDTree nearest neighbor search to transfer attributes from
     the segmented (coarse) file to the target (fine) file.
+
+    Memory-efficient: the segmented file is loaded fully (for KDTree), but
+    the target file is streamed in chunks so it never needs to fit in RAM.
+    Peak RAM per tile ≈ KDTree(segmented) + dim arrays + one target chunk.
 
     Args:
         segmented_file: Path to segmented LAZ file (e.g., 10cm with predictions)
@@ -211,92 +221,125 @@ def remap_single_tile(
     Returns:
         Tuple of (tile_id, success, message, point_count)
     """
-    tile_id = segmented_file.stem.replace('_segmented', '').replace('_results', '')
-    
+    tile_id = normalize_tile_id(segmented_file.stem)
+
     try:
-        # Load segmented point cloud (source of predictions)
-        print(f"    Loading segmented file...")
+        import time as _time
+        t0 = _time.monotonic()
+
+        # ── 1. Load segmented file (smaller, 10cm) fully for KDTree ──
+        print(f"    [{tile_id}] Loading segmented file...", flush=True)
         segmented_las = laspy.read(
-            str(segmented_file), 
-            laz_backend=laspy.LazBackend.LazrsParallel
+            str(segmented_file),
+            laz_backend=laspy.LazBackend.Lazrs,
         )
-        segmented_points = np.vstack((
-            segmented_las.x, 
-            segmented_las.y, 
-            segmented_las.z
-        )).T
-        print(f"    Segmented file: {len(segmented_points):,} points")
-        
-        # Load target resolution point cloud
-        print(f"    Loading target file...")
-        target_las = laspy.read(
-            str(target_file), 
-            laz_backend=laspy.LazBackend.LazrsParallel
-        )
-        target_points = np.vstack((
-            target_las.x, 
-            target_las.y, 
-            target_las.z
-        )).T
-        print(f"    Target file: {len(target_points):,} points")
-        
-        # Create KDTree from segmented points with progress indication
-        print(f"    Building KDTree from {len(segmented_points):,} points...", end="", flush=True)
-        tree = cKDTree(segmented_points)
-        print(" ✓")
-        
-        # Query nearest neighbors
-        print(f"    Querying nearest neighbors for {len(target_points):,} points...", end="", flush=True)
-        distances, indices = tree.query(target_points, workers=-1)
-        print(" ✓")
-        
+        seg_n = segmented_las.header.point_count
+        print(f"    [{tile_id}] Segmented file: {seg_n:,} points", flush=True)
+
+        # Build KDTree from segmented XYZ
+        seg_xyz = np.column_stack((
+            segmented_las.x, segmented_las.y, segmented_las.z
+        ))
+        print(f"    [{tile_id}] Building KDTree from {seg_n:,} points...", end="", flush=True)
+        tree = cKDTree(seg_xyz)
+        del seg_xyz  # tree has its own copy
+        print(" done", flush=True)
+
+        # Extract extra-dim arrays we need to transfer, then free the laspy object
         source_extra_dims = list(segmented_las.point_format.extra_dimensions)
-        target_extra_dim_names = set(target_las.point_format.dimension_names)
+        seg_dim_arrays: Dict[str, np.ndarray] = {}
+        for dim_info in source_extra_dims:
+            seg_dim_arrays[dim_info.name] = np.array(getattr(segmented_las, dim_info.name))
+        del segmented_las  # free ~3 GB
 
-        if len(source_extra_dims) == 0:
-            print(f"    Warning: No extra dimensions found in segmented file")
+        if not source_extra_dims:
+            print(f"    [{tile_id}] Warning: No extra dimensions found in segmented file", flush=True)
 
-        # Resolve names and collect params for batch add
-        dims_to_add = []  # (extra_params, source_dim_name)
+        # ── 2. Read target header to prepare output ──
+        with laspy.open(str(target_file), laz_backend=laspy.LazBackend.Lazrs) as tgt_reader:
+            tgt_header = tgt_reader.header
+            tgt_n = tgt_header.point_count
+            target_dim_names = set(tgt_header.point_format.dimension_names)
+
+        print(f"    [{tile_id}] Target file: {tgt_n:,} points ({tgt_n // chunk_size + 1} chunks)", flush=True)
+
+        # ── 3. Determine which dims to transfer and their output names ──
+        dims_to_add: List[Tuple[laspy.ExtraBytesParams, str]] = []  # (params, src_name)
+        out_dim_names = set(target_dim_names)
+
         for dim_info in source_extra_dims:
             dim_name = dim_info.name
-            # If branding is active, only transfer 3DTrees dims with branded names
             if threedtrees_dims is not None:
                 if dim_name not in threedtrees_dims:
                     continue
                 out_name = f"3DT_{dim_name}_{threedtrees_suffix}" if threedtrees_suffix else f"3DT_{dim_name}"
             else:
-                # No branding — use collision-safe naming
                 out_name = dim_name
-                if out_name in target_extra_dim_names:
+                if out_name in out_dim_names:
                     suffix = 1
-                    while f"{dim_name}_{suffix}" in target_extra_dim_names:
+                    while f"{dim_name}_{suffix}" in out_dim_names:
                         suffix += 1
                     out_name = f"{dim_name}_{suffix}"
             dims_to_add.append((extra_bytes_params_from_dimension_info(dim_info, name=out_name), dim_name))
-            target_extra_dim_names.add(out_name)
-        
-        if dims_to_add:
-            target_las.add_extra_dims([params for params, _ in dims_to_add])
-            for params, src_name in dims_to_add:
-                setattr(target_las, params.name, getattr(segmented_las, src_name)[indices])
-        
-        # Create output directory if needed
+            out_dim_names.add(out_name)
+
+        # ── 4. Create output header (target format + extra dims) ──
+        out_header = laspy.LasHeader(
+            point_format=tgt_header.point_format, version=tgt_header.version
+        )
+        out_header.offsets = tgt_header.offsets
+        out_header.scales = tgt_header.scales
+        for params, _ in dims_to_add:
+            out_header.add_extra_dim(params)
+
+        # ── 5. Stream target in chunks, query KDTree, write enriched output ──
         output_file.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Save output
-        with open(str(output_file), "wb") as f:
-            target_las.write(
-                f, 
-                do_compress=True, 
-                laz_backend=laspy.LazBackend.LazrsParallel
-            )
-            f.flush()
-            os.fsync(f.fileno())
-        
-        return (tile_id, True, "Success", len(target_points))
-        
+        total_written = 0
+
+        with laspy.open(str(target_file), laz_backend=laspy.LazBackend.Lazrs) as tgt_reader:
+            with laspy.open(
+                str(output_file), mode="w", header=out_header,
+                laz_backend=laspy.LazBackend.Lazrs, do_compress=True,
+            ) as writer:
+                chunk_i = 0
+                for chunk in tgt_reader.chunk_iterator(chunk_size):
+                    chunk_len = len(chunk)
+                    chunk_xyz = np.column_stack((chunk.x, chunk.y, chunk.z))
+                    _, indices = tree.query(chunk_xyz, workers=-1)
+                    del chunk_xyz
+
+                    # Build output point record with all target dims + extra dims
+                    out_record = laspy.ScaleAwarePointRecord.zeros(
+                        chunk_len, header=out_header
+                    )
+                    # Copy target dimensions that exist in both chunk and output
+                    chunk_dims = set(chunk.point_format.dimension_names)
+                    out_dims = set(out_header.point_format.dimension_names)
+                    for dim_name in chunk_dims & out_dims:
+                        out_record[dim_name] = chunk[dim_name]
+                    # Transfer segmented dims via KDTree indices
+                    for params, src_name in dims_to_add:
+                        out_record[params.name] = seg_dim_arrays[src_name][indices]
+
+                    writer.write_points(out_record)
+                    total_written += chunk_len
+                    chunk_i += 1
+                    pct = total_written / tgt_n * 100 if tgt_n else 100
+                    elapsed = _time.monotonic() - t0
+                    rate = total_written / elapsed if elapsed > 0 else 0
+                    print(
+                        f"    [{tile_id}] Chunk {chunk_i}: {chunk_len:,} pts "
+                        f"({pct:.0f}%, {rate:,.0f} pts/s)",
+                        flush=True,
+                    )
+
+        elapsed = _time.monotonic() - t0
+        print(f"    [{tile_id}] Done: {total_written:,} points in {elapsed:.1f}s", flush=True)
+        return (tile_id, True, "Success", total_written)
+
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return (tile_id, False, str(e), 0)
 
 
@@ -320,13 +363,24 @@ def _match_files_via_json(
     if len(source_files) == 1 and len(target_files) == 1:
         src = source_files[0]
         tgt = target_files[0]
-        tile_id = re.sub(r"_segmented$|_results$|_subsampled[\d.]+m$", "", src.stem)
+        tile_id = normalize_tile_id(src.stem)
         if not tile_id:
             tile_id = src.stem
         print(f"  Single file pair: {src.name} <-> {tgt.name}")
         return [(src, tgt, tile_id)]
 
-    json_bounds, centers, _ = build_neighbor_graph_from_bounds_json(tile_bounds_json)
+    with tile_bounds_json.open() as f:
+        json_data = json.load(f)
+    json_labels = [
+        f"c{int(tile['col']):02d}_r{int(tile['row']):02d}"
+        if "col" in tile and "row" in tile else None
+        for tile in json_data.get("tiles", [])
+    ]
+
+    json_bounds, centers, _ = build_neighbor_graph_from_bounds_json(
+        tile_bounds_json,
+        bounds_field="actual_bounds",
+    )
 
     source_boundaries: Dict[str, Tuple[float, float, float, float]] = {}
     stem_to_source_path: Dict[str, Path] = {}
@@ -352,10 +406,10 @@ def _match_files_via_json(
         raise ValueError("Could not read bounds from any target file")
 
     source_to_json, json_to_source = _match_tiles_to_json_bounds(
-        source_boundaries, json_bounds, centers
+        source_boundaries, json_bounds, centers, json_labels=json_labels
     )
     target_to_json, json_to_target = _match_tiles_to_json_bounds(
-        target_boundaries, json_bounds, centers
+        target_boundaries, json_bounds, centers, json_labels=json_labels
     )
 
     matches: List[Tuple[Path, Path, str]] = []
@@ -371,7 +425,7 @@ def _match_files_via_json(
             continue
         src_path = stem_to_source_path[src_stem]
         tgt_path = stem_to_target_path[tgt_stem]
-        tile_id = re.sub(r"_segmented$|_results$|_subsampled[\d.]+m$", "", src_stem)
+        tile_id = normalize_tile_id(src_stem)
         if not tile_id:
             tile_id = src_stem
         matches.append((src_path, tgt_path, tile_id))
@@ -524,7 +578,7 @@ def find_matching_files(
             tile_id = tile_id_match.group(1)
         else:
             # Fallback: use filename stem without extension
-            tile_id = source_file.stem.replace('_segmented', '').replace('_results', '')
+            tile_id = normalize_tile_id(source_file.stem)
 
         matches.append((source_file, target_file, tile_id))
 
@@ -551,8 +605,8 @@ def find_matching_files(
 
 def _remap_worker_item(item):
     """Unpack work item and call remap_single_tile; must be at module level for ProcessPoolExecutor pickle."""
-    src, tgt, out, _tid = item
-    return remap_single_tile(src, tgt, out)
+    src, tgt, out, _tid, chunk_sz = item
+    return remap_single_tile(src, tgt, out, chunk_size=chunk_sz)
 
 
 def remap_all_tiles(
@@ -563,6 +617,7 @@ def remap_all_tiles(
     verbose: bool = False,
     tile_bounds_json: Optional[Path] = None,
     num_workers: int = 4,
+    merge_chunk_size: int = 2_000_000,
 ) -> Path:
     """
     Remap predictions from source files to target files for all tiles.
@@ -630,12 +685,15 @@ def remap_all_tiles(
     total_points = 0
     work_items = []
 
+    remap_chunk = merge_chunk_size * 3
+    print(f"  Remap chunk size: {remap_chunk:,} points (merge_chunk_size={merge_chunk_size:,} x3)")
+
     for source_file, target_file, tile_id in matches:
         output_file = output_folder / f"{tile_id}_segmented_remapped.laz"
         if output_file.exists() and output_file.stat().st_size > 0:
             successful += 1
             continue
-        work_items.append((source_file, target_file, output_file, tile_id))
+        work_items.append((source_file, target_file, output_file, tile_id, remap_chunk))
 
     if successful > 0:
         print(f"  Skipping {successful} already processed tiles")
