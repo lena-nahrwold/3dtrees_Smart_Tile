@@ -16,6 +16,7 @@ import gc
 import json
 import sys
 import shutil
+import tempfile
 import numpy as np
 import laspy
 from pathlib import Path
@@ -100,6 +101,61 @@ class TileMetadataResult:
     kept_local_ids: Set[int]
     extra_dim_names: List[str]
     extra_dim_dtypes: Dict[str, np.dtype]
+
+
+class _StreamingCopcWriter:
+    """Stream point chunks into LAS parts, then finalize them as one COPC tile."""
+
+    def __init__(
+        self,
+        final_copc: Path,
+        header_snapshot,
+        label: str,
+    ) -> None:
+        from main_tile import _make_tile_header
+
+        self.final_copc = final_copc
+        self.label = label
+        self._make_tile_header = _make_tile_header
+        self.temp_dir = Path(
+            tempfile.mkdtemp(
+                prefix=f"{final_copc.stem}_stream_",
+                dir=str(final_copc.parent),
+            )
+        )
+        self.parts_dir = self.temp_dir / "parts"
+        self.parts_dir.mkdir(parents=True, exist_ok=True)
+        self.header_snapshot = header_snapshot
+        self.parts: List[Path] = []
+        self.part_idx = 0
+
+    def write_points(self, points) -> None:
+        if len(points) == 0:
+            return
+        part_path = self.parts_dir / f"part_{self.part_idx:05d}.las"
+        part_header = self._make_tile_header(self.header_snapshot)
+        with laspy.open(str(part_path), mode="w", header=part_header) as writer:
+            writer.write_points(points)
+        self.parts.append(part_path)
+        self.part_idx += 1
+
+    def finalize(self) -> Tuple[bool, str]:
+        from main_tile import _finalize_tile_to_copc_untwine
+
+        if not self.parts:
+            return (False, "no filtered points were available for COPC finalization")
+        success, message = _finalize_tile_to_copc_untwine(
+            parts=self.parts,
+            final_tile=self.final_copc,
+            log_dir=self.temp_dir,
+            label=self.label,
+        )
+        if not success:
+            self.final_copc.unlink(missing_ok=True)
+        return (success, message)
+
+    def cleanup(self) -> None:
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
 
 
 # =============================================================================
@@ -1569,6 +1625,8 @@ def write_filtered_tiles_streaming(
     neighbors_by_tile: Dict[str, Dict[str, Optional[str]]],
     core_bounds_by_tile: Dict[str, Tuple[float, float, float, float]],
     output_dir: Path,
+    copc_output_dir: Optional[Path] = None,
+    copc_chunk_size: int = 20_000_000,
     instance_dimension: str = "PredInstance",
     chunk_size: int = 1_000_000,
     filter_anchor: str = "centroid",
@@ -1587,6 +1645,8 @@ def write_filtered_tiles_streaming(
         neighbors_by_tile:   direction → neighbor name for each tile.
         core_bounds_by_tile: (min_x, max_x, min_y, max_y) core region per tile.
         output_dir:          Directory to write filtered LAZ files.
+        copc_output_dir:     Optional directory for immediate per-tile COPC writes.
+        copc_chunk_size:     Kept for API compatibility with other COPC paths.
         instance_dimension:  Name of the instance-ID extra dim (default PredInstance).
         chunk_size:          Points per streaming chunk.
         filter_anchor:       Which point of each instance is checked against the buffer:
@@ -1597,9 +1657,13 @@ def write_filtered_tiles_streaming(
     from merge_tiles import extra_bytes_params_from_dimension_info
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    if copc_output_dir is not None:
+        copc_output_dir.mkdir(parents=True, exist_ok=True)
     print(f"\n{'=' * 60}")
     print("Filter Task: Writing filtered tiles (buffer-only removal)")
     print(f"{'=' * 60}")
+    if copc_output_dir is not None:
+        print(f"  COPC output: {copc_output_dir}", flush=True)
 
     n_tiles = len(tile_results)
     total_removed_pts = 0
@@ -1641,6 +1705,7 @@ def write_filtered_tiles_streaming(
             with laspy.open(str(filepath), laz_backend=laspy.LazBackend.LazrsParallel) as reader:
                 in_header = reader.header
                 in_pf = in_header.point_format
+                copc_writer = None
 
                 # Build output header mirroring input (preserve format, scales, extra dims)
                 out_header = laspy.LasHeader(
@@ -1657,6 +1722,33 @@ def write_filtered_tiles_streaming(
                 }
                 n_in = in_header.point_count
                 n_out = 0
+
+                if copc_output_dir is not None:
+                    copc_path = copc_output_dir / f"{output_path.stem}.copc.laz"
+                    if copc_path.exists() and copc_path.stat().st_size > 0:
+                        from filter_task_support import validate_pointcloud_header
+
+                        ok, reason = validate_pointcloud_header(copc_path)
+                        if ok:
+                            print(f"    Reusing filtered COPC: {copc_path.name}", flush=True)
+                        else:
+                            print(
+                                f"    Existing filtered COPC invalid, regenerating: "
+                                f"{copc_path.name} ({reason})",
+                                flush=True,
+                            )
+                            copc_path.unlink(missing_ok=True)
+                            copc_writer = _StreamingCopcWriter(
+                                final_copc=copc_path,
+                                header_snapshot=in_header,
+                                label=tile_name,
+                            )
+                    else:
+                        copc_writer = _StreamingCopcWriter(
+                            final_copc=copc_path,
+                            header_snapshot=in_header,
+                            label=tile_name,
+                        )
 
                 with laspy.open(
                     str(output_path), mode="w", header=out_header,
@@ -1687,6 +1779,8 @@ def write_filtered_tiles_streaming(
                                 ], dtype=np.int32)
                                 setattr(out_chunk, instance_dimension, remapped)
                             writer.write_points(out_chunk)
+                            if copc_writer is not None:
+                                copc_writer.write_points(out_chunk)
                             n_out += int(keep_mask.sum())
 
             removed_pts = n_in - n_out
@@ -1696,6 +1790,29 @@ def write_filtered_tiles_streaming(
                 f"({removed_pts:,} pts removed)",
                 flush=True,
             )
+
+            if copc_writer is not None:
+                try:
+                    success, message = copc_writer.finalize()
+                    if success:
+                        print(
+                            f"    Filtered COPC ready: {copc_writer.final_copc.name} ({message})",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"    Warning: filtered COPC finalization failed for {output_path.name} "
+                            f"({message}); LAZ fallback retained",
+                            flush=True,
+                        )
+                except Exception as copc_exc:
+                    print(
+                        f"    Warning: filtered COPC finalization raised for {output_path.name} "
+                        f"({copc_exc}); LAZ fallback retained",
+                        flush=True,
+                    )
+                finally:
+                    copc_writer.cleanup()
 
         except Exception as e:
             print(f"    Error processing {tile_name}: {e}", flush=True)

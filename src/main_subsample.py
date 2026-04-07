@@ -213,7 +213,9 @@ def subsample_tile_chunk(args: Tuple[Path, str, float, Path, int, int, bool]) ->
         return (None, 0)
 
 
-def subsample_single_file(args: Tuple[Path, Path, float, Path, int, bool]) -> Tuple[str, bool, str, int]:
+def subsample_single_file(
+    args: Tuple[Path, Path, float, Path, int, bool, bool]
+) -> Tuple[str, bool, str, int]:
     """
     Subsample a single file by splitting it into subtiles along X-axis and processing in parallel.
     
@@ -223,12 +225,14 @@ def subsample_single_file(args: Tuple[Path, Path, float, Path, int, bool]) -> Tu
     3. Merge all subsampled subtiles back together
     
     Args:
-        args: Tuple of (input_file, output_file, resolution, pipeline_dir, num_threads)
+        args: Tuple of
+            (input_file, output_file, resolution, pipeline_dir, num_threads,
+             dimension_reduction, output_as_copc)
     
     Returns:
         Tuple of (filename, success, message, point_count)
     """
-    input_file, output_file, resolution, pipeline_dir, num_threads, dimension_reduction = args
+    input_file, output_file, resolution, pipeline_dir, num_threads, dimension_reduction, output_as_copc = args
     try:
         print(f"    → Processing {input_file.name}...")
         
@@ -236,7 +240,14 @@ def subsample_single_file(args: Tuple[Path, Path, float, Path, int, bool]) -> Tu
         bounds = get_file_bounds(input_file)
         if not bounds:
             # Fall back to simple single-pass subsampling when bounds cannot be determined
-            return subsample_simple(input_file, output_file, resolution, pipeline_dir, dimension_reduction)
+            return subsample_simple(
+                input_file,
+                output_file,
+                resolution,
+                pipeline_dir,
+                dimension_reduction,
+                output_as_copc,
+            )
         
         minx, maxx, miny, maxy = bounds
 
@@ -245,7 +256,14 @@ def subsample_single_file(args: Tuple[Path, Path, float, Path, int, bool]) -> Tu
         # from the COPC reader. In that case, fall back to the simple
         # single-pass subsampling without spatial chunking.
         if maxx - minx == 0 or maxy - miny == 0:
-            return subsample_simple(input_file, output_file, resolution, pipeline_dir, dimension_reduction)
+            return subsample_simple(
+                input_file,
+                output_file,
+                resolution,
+                pipeline_dir,
+                dimension_reduction,
+                output_as_copc,
+            )
 
         # Split into num_threads subtiles along X-axis only
         grid_x = num_threads
@@ -286,47 +304,68 @@ def subsample_single_file(args: Tuple[Path, Path, float, Path, int, bool]) -> Tu
         
         if not chunk_files:
             return (input_file.name, False, "No chunks produced", 0)
-        
-        print(f"      → Merging {len(chunk_files)} subsampled subtiles...")
-        
-        # Merge chunks using PDAL - always write as LAZ format
-        # Chunk files are already LAZ from subsample_tile_chunk
-        reader_type = "readers.las"  # Chunks are LAZ files
-        
-        # Ensure output is LAZ format
-        if not output_file.name.endswith('.laz'):
-            output_file = output_file.parent / (output_file.stem + '.laz')
-        
-        merge_writer = {
-            "type": "writers.las",
-            "filename": str(output_file),
-            "compression": True,
-        }
-        if dimension_reduction:
-            merge_writer["minor_version"] = 2
-            merge_writer["dataformat_id"] = 0
+
+        if output_as_copc:
+            from main_tile import _finalize_tile_to_copc_untwine
+
+            if not output_file.name.endswith(".copc.laz"):
+                if output_file.suffix.lower() == ".laz":
+                    output_file = output_file.with_suffix("").with_suffix(".copc.laz")
+                else:
+                    output_file = output_file.parent / f"{output_file.stem}.copc.laz"
+
+            print(f"      → Finalizing {len(chunk_files)} subsampled subtiles directly to COPC...")
+            success, message = _finalize_tile_to_copc_untwine(
+                parts=sorted(chunk_files),
+                final_tile=output_file,
+                log_dir=chunk_dir,
+                label=output_file.stem,
+            )
+            result_ok = success
+            result_message = message
         else:
-            merge_writer["minor_version"] = 4
-            merge_writer["extra_dims"] = "all"
-        merge_pipeline = {
-            "pipeline": [
-                *[{"type": reader_type, "filename": str(f)} for f in chunk_files],
-                {"type": "filters.merge"},
-                merge_writer,
-            ]
-        }
-        
-        merge_pipeline_file = chunk_dir / "merge.json"
-        with open(merge_pipeline_file, 'w') as f:
-            json.dump(merge_pipeline, f, indent=2)
-        
-        pdal_cmd = get_pdal_path()
-        result = subprocess.run(
-            [pdal_cmd, "pipeline", str(merge_pipeline_file)],
-            capture_output=True,
-            text=True,
-            check=False
-        )
+            print(f"      → Merging {len(chunk_files)} subsampled subtiles...")
+
+            # Merge chunks using PDAL - always write as LAZ format
+            # Chunk files are already LAZ from subsample_tile_chunk
+            reader_type = "readers.las"  # Chunks are LAZ files
+
+            # Ensure output is LAZ format
+            if not output_file.name.endswith('.laz'):
+                output_file = output_file.parent / (output_file.stem + '.laz')
+
+            merge_writer = {
+                "type": "writers.las",
+                "filename": str(output_file),
+                "compression": True,
+            }
+            if dimension_reduction:
+                merge_writer["minor_version"] = 2
+                merge_writer["dataformat_id"] = 0
+            else:
+                merge_writer["minor_version"] = 4
+                merge_writer["extra_dims"] = "all"
+            merge_pipeline = {
+                "pipeline": [
+                    *[{"type": reader_type, "filename": str(f)} for f in chunk_files],
+                    {"type": "filters.merge"},
+                    merge_writer,
+                ]
+            }
+
+            merge_pipeline_file = chunk_dir / "merge.json"
+            with open(merge_pipeline_file, 'w') as f:
+                json.dump(merge_pipeline, f, indent=2)
+
+            pdal_cmd = get_pdal_path()
+            result = subprocess.run(
+                [pdal_cmd, "pipeline", str(merge_pipeline_file)],
+                capture_output=True,
+                text=True,
+                check=False
+            )
+            result_ok = result.returncode == 0
+            result_message = result.stderr[:100] if result.stderr else "merge failed"
         
         # Clean up chunks and temporary files
         for chunk_file in chunk_files:
@@ -337,6 +376,7 @@ def subsample_single_file(args: Tuple[Path, Path, float, Path, int, bool]) -> Tu
                     pass
         
         # Clean up merge pipeline
+        merge_pipeline_file = chunk_dir / "merge.json"
         if merge_pipeline_file.exists():
             try:
                 merge_pipeline_file.unlink()
@@ -351,8 +391,9 @@ def subsample_single_file(args: Tuple[Path, Path, float, Path, int, bool]) -> Tu
             except Exception:
                 pass
         
-        if result.returncode != 0:
-            return (input_file.name, False, f"Merge failed: {result.stderr[:100]}", 0)
+        if not result_ok:
+            failure_prefix = "COPC finalize failed" if output_as_copc else "Merge failed"
+            return (input_file.name, False, f"{failure_prefix}: {result_message}", 0)
         
         if not output_file.exists() or output_file.stat().st_size == 0:
             return (input_file.name, False, "Output file empty", 0)
@@ -366,12 +407,18 @@ def subsample_single_file(args: Tuple[Path, Path, float, Path, int, bool]) -> Tu
 
 
 def subsample_simple(
-    input_file: Path, output_file: Path, resolution: float, pipeline_dir: Path, dimension_reduction: bool = True
+    input_file: Path,
+    output_file: Path,
+    resolution: float,
+    pipeline_dir: Path,
+    dimension_reduction: bool = True,
+    output_as_copc: bool = False,
 ) -> Tuple[str, bool, str, int]:
     """
     Simple single-pass subsampling (fallback method) with COPC reader optimization.
     
-    Uses COPC reader for efficient reading, but always outputs LAZ format.
+    Uses COPC reader for efficient reading. The default output is LAZ, but
+    callers can request a direct final COPC by converting the temporary LAZ.
     When dimension_reduction is True, only standard dimensions are written (minimal output).
     
     Args:
@@ -388,13 +435,19 @@ def subsample_simple(
         is_copc = input_file.name.endswith('.copc.laz')
         reader_type = "readers.copc" if is_copc else "readers.las"
         
-        # Always output as LAZ format (compressed LAS)
-        if not output_file.name.endswith('.laz'):
-            output_file = output_file.parent / (output_file.stem + '.laz')
+        # Write a temporary LAZ first; some callers then finalize to COPC.
+        final_output_file = output_file
+        if output_as_copc:
+            temp_output_file = pipeline_dir / f"{output_file.stem}_tmp.laz"
+        else:
+            temp_output_file = output_file
+
+        if not temp_output_file.name.endswith('.laz'):
+            temp_output_file = temp_output_file.parent / (temp_output_file.stem + '.laz')
         
         writer_opts = {
             "type": "writers.las",
-            "filename": str(output_file),
+            "filename": str(temp_output_file),
             "compression": True,
         }
         if dimension_reduction:
@@ -453,8 +506,31 @@ def subsample_simple(
             else:
                 return (input_file.name, False, result.stderr[:200], 0)
 
-        if not output_file.exists() or output_file.stat().st_size == 0:
+        if not temp_output_file.exists() or temp_output_file.stat().st_size == 0:
             return (input_file.name, False, "Output file empty", 0)
+
+        if output_as_copc:
+            from main_tile import _convert_laz_to_copc
+
+            if not final_output_file.name.endswith(".copc.laz"):
+                if final_output_file.suffix.lower() == ".laz":
+                    final_output_file = final_output_file.with_suffix("").with_suffix(".copc.laz")
+                else:
+                    final_output_file = final_output_file.parent / f"{final_output_file.stem}.copc.laz"
+
+            success, message = _convert_laz_to_copc(
+                input_laz=temp_output_file,
+                output_copc=final_output_file,
+                chunk_size=int(TILE_PARAMS.get("chunk_size", 20_000_000) or 20_000_000),
+                chunkwise_source_creation=False,
+            )
+            temp_output_file.unlink(missing_ok=True)
+            if not success:
+                final_output_file.unlink(missing_ok=True)
+                return (input_file.name, False, f"COPC conversion failed: {message}", 0)
+            output_file = final_output_file
+        else:
+            output_file = temp_output_file
 
         # Get point count
         point_count = 0
@@ -486,6 +562,7 @@ def subsample_parallel(
     num_threads: int,
     output_prefix: Optional[str] = None,
     dimension_reduction: bool = True,
+    output_as_copc: bool = False,
 ) -> List[Path]:
     """
     Subsample all files in directory using parallel chunk processing.
@@ -503,6 +580,7 @@ def subsample_parallel(
         num_threads: Number of spatial chunks per file (from TILE_PARAMS['threads'])
         output_prefix: Optional prefix for output filenames
         dimension_reduction: If True, write only standard dimensions (no extra_dims); default True = minimal.
+        output_as_copc: If True, finalize each output tile as `.copc.laz`.
     
     Returns:
         List of created output file paths
@@ -563,29 +641,38 @@ def subsample_parallel(
             if base_before_tile:
                 base_before_tile = re.sub(r'^[^_]+_\d+m_', '', base_before_tile)
                 if base_before_tile:
-                    output_name = f"{base_before_tile}_{tile_id}_subsampled_{res_cm}cm.laz"
+                    output_name = f"{base_before_tile}_{tile_id}_subsampled_{res_cm}cm"
                 else:
-                    output_name = f"{tile_id}_subsampled_{res_cm}cm.laz"
+                    output_name = f"{tile_id}_subsampled_{res_cm}cm"
             else:
-                output_name = f"{tile_id}_subsampled_{res_cm}cm.laz"
+                output_name = f"{tile_id}_subsampled_{res_cm}cm"
         else:
             # Single file or no tile ID - use clean base name
             # Remove any remaining prefix patterns
             base_name = re.sub(r'^[^_]+_\d+m_', '', base_name)
-            output_name = f"{base_name}_subsampled_{res_cm}cm.laz"
-        
-        output_file = output_dir / output_name
-        
-        # Skip if already exists
+            output_name = f"{base_name}_subsampled_{res_cm}cm"
+
+        output_suffix = ".copc.laz" if output_as_copc else ".laz"
+        output_file = output_dir / f"{output_name}{output_suffix}"
+
         if output_file.exists() and output_file.stat().st_size > 0:
             print(f"    ⊙ Skipping {input_file.name} (already exists)")
             continue
         
-        tasks.append((input_file, output_file, resolution, pipeline_dir, num_threads, dimension_reduction))
+        tasks.append((
+            input_file,
+            output_file,
+            resolution,
+            pipeline_dir,
+            num_threads,
+            dimension_reduction,
+            output_as_copc,
+        ))
     
     if not tasks:
         print(f"    ✓ All files already subsampled")
-        return list(output_dir.glob("*.laz"))
+        pattern = "*.copc.laz" if output_as_copc else "*.laz"
+        return sorted(output_dir.glob(pattern))
     
     print(f"    Files to process: {len(tasks)}")
     print(f"    Processing mode: Sequential (one file at a time)")
@@ -615,7 +702,8 @@ def subsample_parallel(
     print(f"    Complete: {successful} successful, {failed} failed")
     print(f"    Total points: {total_points:,}")
     
-    return list(output_dir.glob("*.laz"))
+    pattern = "*.copc.laz" if output_as_copc else "*.laz"
+    return sorted(output_dir.glob(pattern))
 
 
 def run_subsample_pipeline(
@@ -696,12 +784,13 @@ def run_subsample_pipeline(
         num_threads=num_threads,
         output_prefix=output_prefix,
         dimension_reduction=dimension_reduction,
+        output_as_copc=True,
     )
     
     if not res1_files:
         raise ValueError(f"No files created in {subsampled_res1_dir}")
-    
-    print(f"\n  ✓ {res1_cm}cm subsampling complete: {len(res1_files)} files")
+
+    print(f"\n  ✓ {res1_cm}cm subsampling complete: {len(res1_files)} COPC files")
     print(f"  Output: {subsampled_res1_dir}")
     
     # Step 2: Subsample resolution 1 to resolution 2
@@ -718,6 +807,7 @@ def run_subsample_pipeline(
         num_threads=num_threads,
         output_prefix=output_prefix,
         dimension_reduction=dimension_reduction,
+        output_as_copc=False,
     )
     
     if not res2_files:
@@ -731,8 +821,8 @@ def run_subsample_pipeline(
     print("=" * 60)
     print("Subsampling Pipeline Complete")
     print("=" * 60)
-    print(f"  Resolution 1 ({res1_cm}cm): {len(res1_files)} files in {subsampled_res1_dir}")
-    print(f"  Resolution 2 ({res2_cm}cm): {len(res2_files)} files in {subsampled_res2_dir}")
+    print(f"  Resolution 1 ({res1_cm}cm): {len(res1_files)} COPC files in {subsampled_res1_dir}")
+    print(f"  Resolution 2 ({res2_cm}cm): {len(res2_files)} LAZ files in {subsampled_res2_dir}")
     
     return subsampled_res1_dir, subsampled_res2_dir
 
@@ -813,4 +903,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

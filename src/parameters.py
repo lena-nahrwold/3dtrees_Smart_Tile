@@ -308,6 +308,36 @@ class Parameters(BaseSettings):
         validation_alias=AliasChoices("remap-dims", "remap_dims"),
     )
 
+    remap_spatial_slices: int = Field(
+        10,
+        description="Number of spatial slices per original file for multi-collection remap "
+                    "(higher = lower peak RAM, more subset queries).",
+        validation_alias=AliasChoices("remap-spatial-slices", "remap_spatial_slices"),
+    )
+
+    remap_spatial_chunk_length: Optional[float] = Field(
+        None,
+        description="Optional spatial slice length in metres for remap/enrichment. "
+                    "When set, this overrides the fixed slice count and derives the number "
+                    "of slices from the file span.",
+        validation_alias=AliasChoices("remap-spatial-chunk-length", "remap_spatial_chunk_length"),
+    )
+
+    remap_spatial_target_points: Optional[int] = Field(
+        None,
+        description="Optional target number of points per spatial slice for remap/enrichment. "
+                    "When set, this overrides both fixed slice count and metre length and "
+                    "derives the number of slices from the file header point count.",
+        validation_alias=AliasChoices("remap-spatial-target-points", "remap_spatial_target_points"),
+    )
+
+    force_spatial_chunked_fusion: bool = Field(
+        False,
+        description="For multi-collection remap, skip the aligned-fusion check and go directly "
+                    "to chunked spatial fusion before remapping.",
+        validation_alias=AliasChoices("force-spatial-chunked-fusion", "force_spatial_chunked_fusion"),
+    )
+
     min_cluster_size: Optional[int] = Field(
         300,
         description="Minimum cluster size in points for reassignment",
@@ -447,6 +477,10 @@ def print_params(params: Parameters):
     print(f"  disable_matching: {params.disable_matching}")
     print(f"  standardization_json: {params.standardization_json}")
     print(f"  merge_chunk_size: {params.merge_chunk_size:,}")
+    print(f"  remap_spatial_slices: {params.remap_spatial_slices}")
+    print(f"  remap_spatial_chunk_length: {params.remap_spatial_chunk_length}")
+    print(f"  remap_spatial_target_points: {params.remap_spatial_target_points}")
+    print(f"  force_spatial_chunked_fusion: {params.force_spatial_chunked_fusion}")
     print(f"  verbose: {params.verbose}")
     
     print("=" * 60)
@@ -488,6 +522,10 @@ def get_remap_params(params: Parameters) -> dict:
     return {
         'workers': params.workers,
         'instance_dimension': params.instance_dimension,
+        'remap_spatial_slices': params.remap_spatial_slices,
+        'remap_spatial_chunk_length': params.remap_spatial_chunk_length,
+        'remap_spatial_target_points': params.remap_spatial_target_points,
+        'force_spatial_chunked_fusion': params.force_spatial_chunked_fusion,
     }
 
 
@@ -507,6 +545,10 @@ TILE_PARAMS = {
 REMAP_PARAMS = {
     'target_resolution_cm': 2,
     'workers': 4,
+    'remap_spatial_slices': 10,
+    'remap_spatial_chunk_length': None,
+    'remap_spatial_target_points': None,
+    'force_spatial_chunked_fusion': False,
 }
 
 MERGE_PARAMS = {

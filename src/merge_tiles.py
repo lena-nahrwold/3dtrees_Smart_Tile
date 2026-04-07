@@ -75,6 +75,7 @@ _R_TO_LASPY_NAME = {
 }
 
 _RGB_STANDARD_DIMS = ("red", "green", "blue")
+_COPC_READER_FALLBACK_WARNED: Set[str] = set()
 
 
 def get_pdal_path() -> str:
@@ -1789,6 +1790,9 @@ def _write_points_with_dimensions_to_laz(
 def _build_spatial_slices(
     bounds: Tuple[float, float, float, float],
     slice_count: int,
+    slice_length: Optional[float] = None,
+    target_points: Optional[int] = None,
+    total_points: Optional[int] = None,
 ) -> List[Tuple[Tuple[float, float, float, float], str, bool]]:
     """Split XY bounds into thin spatial slices along the longer axis.
 
@@ -1798,7 +1802,7 @@ def _build_spatial_slices(
     xmin, xmax, ymin, ymax = bounds
     x_span = max(0.0, float(xmax) - float(xmin))
     y_span = max(0.0, float(ymax) - float(ymin))
-    if slice_count <= 1 or (x_span == 0.0 and y_span == 0.0):
+    if (slice_count <= 1 and not slice_length and not target_points) or (x_span == 0.0 and y_span == 0.0):
         return [(bounds, "x", True)]
 
     axis = "x" if x_span >= y_span else "y"
@@ -1806,7 +1810,12 @@ def _build_spatial_slices(
     if span == 0.0:
         return [(bounds, axis, True)]
 
-    n_slices = max(1, int(slice_count))
+    if target_points is not None and int(target_points) > 0 and total_points is not None and int(total_points) > 0:
+        n_slices = max(1, int(np.ceil(float(total_points) / float(target_points))))
+    elif slice_length is not None and float(slice_length) > 0:
+        n_slices = max(1, int(np.ceil(span / float(slice_length))))
+    else:
+        n_slices = max(1, int(slice_count))
     step = span / n_slices
     slices: List[Tuple[Tuple[float, float, float, float], str, bool]] = []
     for idx in range(n_slices):
@@ -1821,18 +1830,75 @@ def _build_spatial_slices(
     return slices
 
 
+def _snap_spatial_slices_to_header_grid(
+    slice_specs: List[Tuple[Tuple[float, float, float, float], str, bool]],
+    header,
+) -> List[Tuple[Tuple[float, float, float, float], str, bool]]:
+    """Snap slice boundaries to the point coordinate grid defined by a LAS header.
+
+    This avoids tiny floating-point drift like ``585910.0800000001`` that can
+    leave exact quantized coordinates outside both neighboring slices.
+    """
+    scales = tuple(float(v) for v in getattr(header, "scales", (0.0, 0.0, 0.0)))
+    offsets = tuple(float(v) for v in getattr(header, "offsets", (0.0, 0.0, 0.0)))
+    if len(scales) < 2 or len(offsets) < 2:
+        return slice_specs
+
+    def _snap(value: float, axis_idx: int) -> float:
+        scale = scales[axis_idx]
+        offset = offsets[axis_idx]
+        if not np.isfinite(value) or scale <= 0:
+            return float(value)
+        raw = round((float(value) - offset) / scale)
+        return float(offset + raw * scale)
+
+    snapped = []
+    for slice_bounds, axis, include_upper in slice_specs:
+        xmin, xmax, ymin, ymax = slice_bounds
+        if axis == "x":
+            xmin = _snap(xmin, 0)
+            xmax = _snap(xmax, 0)
+        else:
+            ymin = _snap(ymin, 1)
+            ymax = _snap(ymax, 1)
+        snapped.append(((xmin, xmax, ymin, ymax), axis, include_upper))
+    return snapped
+
+
 def _load_copc_subset_all_dims(
     path: Path,
     bounds: Tuple[float, float, float, float],
     halo: float = 1.0,
     work_dir: Optional[Path] = None,
-) -> Optional[laspy.LasData]:
-    """Load a spatial COPC subset with all dimensions via PDAL."""
+) -> Tuple[Optional[laspy.LasData], int]:
+    """Load a spatial COPC subset with all dimensions.
+
+    Prefer ``laspy.CopcReader`` for in-memory subset reads. Fall back to the
+    older PDAL -> temporary LAS path if direct COPC reads fail for a file.
+    """
     xmin, xmax, ymin, ymax = bounds
     x_lo = xmin - halo
     x_hi = xmax + halo
     y_lo = ymin - halo
     y_hi = ymax + halo
+
+    try:
+        with laspy.CopcReader.open(str(path)) as reader:
+            query_bounds = laspy.copc.Bounds(
+                mins=np.array([x_lo, y_lo], dtype=np.float64),
+                maxs=np.array([x_hi, y_hi], dtype=np.float64),
+            )
+            subset = reader.spatial_query(query_bounds)
+            subset_count = len(subset)
+            return (subset, subset_count) if subset_count > 0 else (None, 0)
+    except Exception as exc:
+        warn_key = str(path)
+        if warn_key not in _COPC_READER_FALLBACK_WARNED:
+            print(
+                f"      CopcReader fallback for {path.name}: {exc}",
+                flush=True,
+            )
+            _COPC_READER_FALLBACK_WARNED.add(warn_key)
 
     work_root = work_dir if work_dir is not None else Path(tempfile.gettempdir())
     work_root.mkdir(parents=True, exist_ok=True)
@@ -1871,8 +1937,9 @@ def _load_copc_subset_all_dims(
             raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "PDAL pipeline failed")
         with laspy.open(str(subset_file), laz_backend=laspy.LazBackend.Lazrs) as reader:
             if reader.header.point_count == 0:
-                return None
-        return laspy.read(str(subset_file), laz_backend=laspy.LazBackend.LazrsParallel)
+                return None, 0
+        subset = laspy.read(str(subset_file), laz_backend=laspy.LazBackend.LazrsParallel)
+        return subset, len(subset.points)
     finally:
         for tmp_path in (pipeline_file, subset_file):
             try:
@@ -2103,6 +2170,8 @@ def remap_to_original_input_files_streaming(
     retile_buffer: float = 2.0,
     chunk_size: int = 1_000_000,
     spatial_slices: int = 50,
+    spatial_chunk_length: Optional[float] = None,
+    spatial_target_points: Optional[int] = None,
     threedtrees_dims: Optional[List[str]] = None,
     threedtrees_suffix: str = "SAT",
     target_dims: Optional[Set[str]] = None,
@@ -2237,20 +2306,27 @@ def remap_to_original_input_files_streaming(
                     do_compress=True, laz_backend=laspy.LazBackend.LazrsParallel,
                 ) as writer:
                     if input_file.name.endswith(".copc.laz"):
-                        slice_specs = _build_spatial_slices(file_bounds, spatial_slices)
+                        slice_specs = _build_spatial_slices(
+                            file_bounds,
+                            spatial_slices,
+                            spatial_chunk_length,
+                            spatial_target_points,
+                            n_input,
+                        )
+                        slice_specs = _snap_spatial_slices_to_header_grid(slice_specs, in_header)
                         print(
                             f"    Spatial slicing: {len(slice_specs)} slices along {slice_specs[0][1].upper()}",
                             flush=True,
                         )
 
                         for slice_idx, (slice_bounds, axis, include_upper) in enumerate(slice_specs, start=1):
-                            subset = _load_copc_subset_all_dims(
+                            subset, subset_count = _load_copc_subset_all_dims(
                                 input_file,
                                 slice_bounds,
                                 halo=1.0,
                                 work_dir=tmp_dir,
                             )
-                            if subset is None:
+                            if subset is None or subset_count == 0:
                                 print(f"      Slice {slice_idx}/{len(slice_specs)}: empty original subset", flush=True)
                                 continue
 
@@ -2303,7 +2379,7 @@ def remap_to_original_input_files_streaming(
                             elapsed = _time.monotonic() - file_start
                             rate = written / elapsed if elapsed > 0 else 0
                             print(
-                                f"      Slice {slice_idx}/{len(slice_specs)}: {len(orig_xyz):,} pts ({pct:.0f}%, {rate:,.0f} pts/s)",
+                                f"      Slice {slice_idx}/{len(slice_specs)}: {len(orig_xyz):,} core pts from {subset_count:,} in-bounds ({pct:.0f}%, {rate:,.0f} pts/s)",
                                 flush=True,
                             )
                             del point_record, orig_xyz, subset, sx, sy, sz
@@ -2560,6 +2636,44 @@ class _OriginalFileCache:
         self._tmp_dir = tmp_dir
         self._chunk_size = chunk_size
 
+    def _load_copc_subset_with_reader(
+        self,
+        path: Path,
+        dims_to_read: Dict[str, str],
+        dim_dtypes: Dict[str, np.dtype],
+        x_lo: float,
+        x_hi: float,
+        y_lo: float,
+        y_hi: float,
+    ) -> Tuple[Optional[np.ndarray], Dict[str, np.ndarray], float]:
+        """Read a bounded COPC subset directly with laspy.CopcReader."""
+        import time as _time
+
+        read_start = _time.monotonic()
+        with laspy.CopcReader.open(str(path)) as reader:
+            query_bounds = laspy.copc.Bounds(
+                mins=np.array([x_lo, y_lo], dtype=np.float64),
+                maxs=np.array([x_hi, y_hi], dtype=np.float64),
+            )
+            points = reader.spatial_query(query_bounds)
+
+        if points is None or len(points) == 0:
+            return None, {}, _time.monotonic() - read_start
+
+        xyz = np.column_stack([
+            np.asarray(points.x),
+            np.asarray(points.y),
+            np.asarray(points.z),
+        ])
+        dim_arrays: Dict[str, np.ndarray] = {}
+        for out_name, orig_name in dims_to_read.items():
+            arr = getattr(points, orig_name, None)
+            if arr is not None:
+                dtype = dim_dtypes.get(out_name, np.float64)
+                dim_arrays[out_name] = np.asarray(arr).astype(dtype, copy=False)
+
+        return xyz, dim_arrays, _time.monotonic() - read_start
+
     def _load_copc_subset_with_pdal(
         self,
         path: Path,
@@ -2657,6 +2771,8 @@ class _OriginalFileCache:
         xy_buffer: float,
     ) -> Optional[Tuple[Optional[cKDTree], Dict[str, np.ndarray]]]:
         """Return cached subset (tree, dims) or None. Marks entry as recently used."""
+        if self._max <= 0:
+            return None
         key = self._subset_key(path, bounds, xy_buffer)
         if key in self._cache:
             self._cache.move_to_end(key)
@@ -2686,15 +2802,16 @@ class _OriginalFileCache:
         x_lo, x_hi, y_lo, y_hi = key[1:]
 
         # Evict if at capacity
-        while len(self._cache) >= self._max:
+        while self._max > 0 and len(self._cache) >= self._max:
             self._evict_lru()
 
         # Read point count from header (single-threaded to avoid OpenMP conflicts)
         with laspy.open(str(path), laz_backend=laspy.LazBackend.Lazrs) as f:
             n_pts = f.header.point_count
 
+        prefix = "Cache loading subset" if self._max > 0 else "Loading subset"
         print(
-            f"    Cache loading subset: {path.name} x=[{x_lo:.1f}, {x_hi:.1f}] "
+            f"    {prefix}: {path.name} x=[{x_lo:.1f}, {x_hi:.1f}] "
             f"y=[{y_lo:.1f}, {y_hi:.1f}] from {n_pts:,} pts... ",
             end="",
             flush=True,
@@ -2702,21 +2819,38 @@ class _OriginalFileCache:
 
         if path.name.endswith(".copc.laz"):
             try:
-                xyz, dim_arrays, read_dt = self._load_copc_subset_with_pdal(
+                xyz, dim_arrays, read_dt = self._load_copc_subset_with_reader(
                     path, dims_to_read, dim_dtypes, x_lo, x_hi, y_lo, y_hi,
                 )
                 if xyz is None:
-                    self._cache[key] = (None, {})
                     total_dt = _time.monotonic() - load_start
+                    result = (None, {})
+                    if self._max > 0:
+                        self._cache[key] = result
                     print(f"empty COPC subset (read {read_dt:.1f}s, total {total_dt:.1f}s)", flush=True)
-                    return self._cache[key]
+                    return result
                 kept_pts = len(xyz)
-                print(f"kept {kept_pts:,} pts via COPC, tree... ", end="", flush=True)
+                print(f"kept {kept_pts:,} pts via COPC reader, tree... ", end="", flush=True)
             except Exception as e:
-                print(f"COPC fallback to streamed scan ({e})... ", end="", flush=True)
-                xyz = None
-                dim_arrays = {}
-                read_dt = 0.0
+                print(f"COPC reader fallback to PDAL ({e})... ", end="", flush=True)
+                try:
+                    xyz, dim_arrays, read_dt = self._load_copc_subset_with_pdal(
+                        path, dims_to_read, dim_dtypes, x_lo, x_hi, y_lo, y_hi,
+                    )
+                    if xyz is None:
+                        total_dt = _time.monotonic() - load_start
+                        result = (None, {})
+                        if self._max > 0:
+                            self._cache[key] = result
+                        print(f"empty COPC subset (read {read_dt:.1f}s, total {total_dt:.1f}s)", flush=True)
+                        return result
+                    kept_pts = len(xyz)
+                    print(f"kept {kept_pts:,} pts via PDAL fallback, tree... ", end="", flush=True)
+                except Exception as p_e:
+                    print(f"PDAL fallback failed ({p_e}); falling back to streamed scan... ", end="", flush=True)
+                    xyz = None
+                    dim_arrays = {}
+                    read_dt = 0.0
         else:
             xyz = None
             dim_arrays = {}
@@ -2752,10 +2886,12 @@ class _OriginalFileCache:
 
             read_dt = _time.monotonic() - read_start
             if kept_pts == 0:
-                self._cache[key] = (None, {})
                 total_dt = _time.monotonic() - load_start
+                result = (None, {})
+                if self._max > 0:
+                    self._cache[key] = result
                 print(f"empty subset (read {read_dt:.1f}s, total {total_dt:.1f}s)", flush=True)
-                return self._cache[key]
+                return result
 
             xyz = np.concatenate(xyz_parts, axis=0)
             dim_arrays = {}
@@ -2770,13 +2906,15 @@ class _OriginalFileCache:
         tree_dt = _time.monotonic() - tree_start
         del xyz
 
-        self._cache[key] = (tree, dim_arrays)
         total_dt = _time.monotonic() - load_start
+        result = (tree, dim_arrays)
+        if self._max > 0:
+            self._cache[key] = result
         print(
-            f"cached (read {read_dt:.1f}s, tree {tree_dt:.1f}s, total {total_dt:.1f}s)",
+            f"{'cached' if self._max > 0 else 'done'} (read {read_dt:.1f}s, tree {tree_dt:.1f}s, total {total_dt:.1f}s)",
             flush=True,
         )
-        return self._cache[key]
+        return result
 
     def _evict_lru(self) -> None:
         """Remove the least-recently-used entry."""
@@ -2809,7 +2947,7 @@ def _scan_merged_dim_stats(
     merged dimensions are empty/constant and should be overwritten.
     """
     dim_stats: Dict[str, Tuple[float, float, int]] = {}
-    with laspy.open(str(merged_laz), laz_backend=laspy.LazBackend.Lazrs) as reader:
+    with laspy.open(str(merged_laz), laz_backend=laspy.LazBackend.LazrsParallel) as reader:
         for chunk in reader.chunk_iterator(chunk_size):
             for dim_name in merged_dim_names - skip_core:
                 arr = getattr(chunk, dim_name, None)
@@ -2843,6 +2981,9 @@ def _add_original_dimensions_to_merged_impl(
     tmp_dir: Path,
     num_threads: int = 4,
     merge_chunk_size: int = 2_000_000,
+    spatial_slices: int = 10,
+    spatial_chunk_length: Optional[float] = None,
+    spatial_target_points: Optional[int] = None,
 ) -> None:
     """Merged-centric streaming enrichment (v3).
 
@@ -2855,9 +2996,11 @@ def _add_original_dimensions_to_merged_impl(
     - No merged coordinates held in RAM (streamed one chunk at a time).
     - No memmaps or temp files.
     - Original files cached via LRU (typically 2-3 in cache at once).
-    - No ThreadPoolExecutor — avoids OpenMP deadlocks.  Intra-query parallelism
-      via ``cKDTree.query(workers=-1)`` uses all CPUs within each query.
-    - Peak RAM ≈ LRU cache size (2-3 original KDTrees + dim arrays).
+    - Optional per-slice parallel subset prep across overlapping original files
+      when ``num_threads > 1``.
+    - KDTree queries still use ``workers=-1`` to consume all available CPUs.
+    - Peak RAM is bounded by the number of overlapping original subsets loaded
+      for the current slice.
     """
 
     skip_core = {"X", "Y", "Z"}
@@ -2951,20 +3094,33 @@ def _add_original_dimensions_to_merged_impl(
     )
 
     # ── Phase 3: Filter by target_dims if standardization mode ──────────
+    requested_target_dims: Set[str] = set()
     if target_dims is not None:
-        skipped_dims = set(orig_dims.keys()) - target_dims - skip_core
+        requested_target_dims = set(target_dims) - skip_core
+        skipped_dims = set(orig_dims.keys()) - requested_target_dims
         if skipped_dims:
             print(f"  Standardization filter: skipping {len(skipped_dims)} dims not in target list: "
                   f"{sorted(skipped_dims)}", flush=True)
-        orig_dims = {k: v for k, v in orig_dims.items() if k in target_dims}
-        orig_extra_dim_info = {k: v for k, v in orig_extra_dim_info.items() if k in target_dims}
+        orig_dims = {k: v for k, v in orig_dims.items() if k in requested_target_dims}
+        orig_extra_dim_info = {k: v for k, v in orig_extra_dim_info.items() if k in requested_target_dims}
+        missing_target_dims = sorted(requested_target_dims - set(orig_dims.keys()))
+        if missing_target_dims:
+            print(
+                f"  Standardization warning: {len(missing_target_dims)} requested dims were not found "
+                f"in the original files and cannot be transferred: {missing_target_dims}",
+                flush=True,
+            )
 
     # ── Phase 4: Determine which dims to add / overwrite ────────────────
     if target_dims is not None:
-        # Standardization mode: force-overwrite target dims
+        # Standardization mode: add all requested original dims that exist, and
+        # force-overwrite any of those names already present in merged.
         dims_to_add_new: Dict[str, np.dtype] = {}
         dims_to_overwrite: Dict[str, np.dtype] = {}
-        for name, dtype in orig_dims.items():
+        for name in sorted(requested_target_dims):
+            if name not in orig_dims:
+                continue
+            dtype = orig_dims[name]
             if name in merged_dim_names:
                 dims_to_overwrite[name] = dtype
             else:
@@ -3013,6 +3169,7 @@ def _add_original_dimensions_to_merged_impl(
 
     spatial_buffer = max(tolerance * 2, 1.0) + retile_buffer
     max_dist = distance_threshold if distance_threshold is not None else spatial_buffer
+    query_workers = max(1, int(num_threads))
 
     promote_rgb_to_standard = (
         has_standard_rgb_dims(orig_dims.keys())
@@ -3123,10 +3280,12 @@ def _add_original_dimensions_to_merged_impl(
         f"({_time.monotonic() - phase_start:.1f}s)",
         flush=True,
     )
-    print(
-        "    Next: read original file bounding boxes, then stream the merged LAZ and enrich it chunk-by-chunk.",
-        flush=True,
+    next_step = (
+        "    Next: read original file bounding boxes, then enrich the merged COPC slice-by-slice."
+        if merged_laz.name.endswith(".copc.laz")
+        else "    Next: read original file bounding boxes, then stream the merged LAZ and enrich it chunk-by-chunk."
     )
+    print(next_step, flush=True)
 
     # ── Pre-compute original file bounding boxes ────────────────────────
     phase_start = _time.monotonic()
@@ -3154,177 +3313,308 @@ def _add_original_dimensions_to_merged_impl(
         flush=True,
     )
 
-    n_chunks = (n_merged + CHUNK_SIZE - 1) // CHUNK_SIZE
     print(
         f"\n  Starting nearest-neighbor enrichment pass: {n_merged:,} merged points, "
         f"{len(eligible_files)} original files",
         flush=True,
     )
-    print(f"  Chunk size: {CHUNK_SIZE:,} points ({n_chunks} chunks expected)", flush=True)
     print(f"  Spatial buffer: {spatial_buffer:.1f}m, max match distance: {max_dist:.1f}m", flush=True)
     print(f"  Dimensions to transfer: {len(dims_to_add)} "
           f"({len(dims_to_add_new)} new, {len(dims_to_overwrite)} replace)", flush=True)
-    print("  This stage streams the merged LAZ, matches points to originals, and rewrites the output.", flush=True)
+    print(f"  Worker usage: up to {query_workers} thread(s) for subset prep; KDTree queries use all available threads", flush=True)
+    merged_is_copc = merged_laz.name.endswith(".copc.laz")
+    if merged_is_copc:
+        merged_bounds = (
+            float(merged_header.x_min),
+            float(merged_header.x_max),
+            float(merged_header.y_min),
+            float(merged_header.y_max),
+        )
+        slice_specs = _build_spatial_slices(
+            merged_bounds,
+            spatial_slices,
+            spatial_chunk_length,
+            spatial_target_points,
+            n_merged,
+        )
+        slice_specs = _snap_spatial_slices_to_header_grid(slice_specs, merged_header)
+        print(
+            f"  Spatial slicing: {len(slice_specs)} slices along {slice_specs[0][1].upper()}",
+            flush=True,
+        )
+        print("  This stage reads spatial COPC windows, matches points to originals, and rewrites the output.", flush=True)
+    else:
+        n_chunks = (n_merged + CHUNK_SIZE - 1) // CHUNK_SIZE
+        print(f"  Chunk size: {CHUNK_SIZE:,} points ({n_chunks} chunks expected)", flush=True)
+        print("  This stage streams the merged LAZ, matches points to originals, and rewrites the output.", flush=True)
 
     # ── Main streaming loop ─────────────────────────────────────────────
     t_start = _time.monotonic()
-    cache = _OriginalFileCache(max_entries=3, tmp_dir=tmp_dir, chunk_size=CHUNK_SIZE)
+    cache = _OriginalFileCache(max_entries=0, tmp_dir=tmp_dir, chunk_size=CHUNK_SIZE)
     total_written = 0
     total_matched = 0
-    chunk_num = 0
+    unit_num = 0
 
-    with laspy.open(str(merged_laz), laz_backend=laspy.LazBackend.Lazrs) as reader:
-        with laspy.open(
-            str(output_path), mode="w", header=out_header,
-            do_compress=True, laz_backend=laspy.LazBackend.Lazrs,
-        ) as writer:
-            for chunk in reader.chunk_iterator(CHUNK_SIZE):
-                chunk_num += 1
-                t_chunk = _time.monotonic()
-                overlap_dt = 0.0
-                cache_dt = 0.0
-                query_dt = 0.0
-                write_dt = 0.0
-                n = len(chunk)
-                cx = np.asarray(chunk.x, dtype=np.float64)
-                cy = np.asarray(chunk.y, dtype=np.float64)
-                cz = np.asarray(chunk.z, dtype=np.float64)
+    with laspy.open(
+        str(output_path), mode="w", header=out_header,
+        do_compress=True, laz_backend=laspy.LazBackend.LazrsParallel,
+    ) as writer:
+        def _process_block(
+            label: str,
+            cx: np.ndarray,
+            cy: np.ndarray,
+            cz: np.ndarray,
+            merged_dim_getter,
+            subset_count: Optional[int] = None,
+        ) -> None:
+            nonlocal total_written, total_matched
+            t_chunk = _time.monotonic()
+            overlap_dt = 0.0
+            subset_prep_dt = 0.0
+            query_dt = 0.0
+            write_dt = 0.0
+            n = len(cx)
+            if n == 0:
+                return
 
-                # Chunk bounding box
-                chunk_xmin, chunk_xmax = float(cx.min()), float(cx.max())
-                chunk_ymin, chunk_ymax = float(cy.min()), float(cy.max())
+            chunk_xmin, chunk_xmax = float(cx.min()), float(cx.max())
+            chunk_ymin, chunk_ymax = float(cy.min()), float(cy.max())
 
-                # Find overlapping originals
-                overlap_start = _time.monotonic()
-                overlapping: List[Path] = []
-                for orig_path in eligible_files:
-                    ox_min, ox_max, oy_min, oy_max = orig_bboxes[orig_path]
-                    if (ox_max + spatial_buffer < chunk_xmin
-                            or ox_min - spatial_buffer > chunk_xmax
-                            or oy_max + spatial_buffer < chunk_ymin
-                            or oy_min - spatial_buffer > chunk_ymax):
-                        continue
-                    overlapping.append(orig_path)
-                overlap_dt = _time.monotonic() - overlap_start
+            overlap_start = _time.monotonic()
+            overlapping: List[Path] = []
+            for orig_path in eligible_files:
+                ox_min, ox_max, oy_min, oy_max = orig_bboxes[orig_path]
+                if (ox_max + spatial_buffer < chunk_xmin
+                        or ox_min - spatial_buffer > chunk_xmax
+                        or oy_max + spatial_buffer < chunk_ymin
+                        or oy_min - spatial_buffer > chunk_ymax):
+                    continue
+                overlapping.append(orig_path)
+            overlap_dt = _time.monotonic() - overlap_start
 
-                # Per-point best distance and dim values for this chunk
-                best_dist = np.full(n, np.inf, dtype=np.float64)
-                best_dims: Dict[str, np.ndarray] = {}
-                for name, dtype in dims_to_add.items():
-                    best_dims[name] = np.zeros(n, dtype=dtype)
+            best_dist = np.full(n, np.inf, dtype=np.float64)
+            best_dims: Dict[str, np.ndarray] = {}
+            for name, dtype in dims_to_add.items():
+                best_dims[name] = np.zeros(n, dtype=dtype)
 
-                chunk_pts = np.column_stack([cx, cy, cz])
+            chunk_pts = np.column_stack([cx, cy, cz])
 
-                for orig_path in overlapping:
-                    # Spatial pre-filter: only query merged points within
-                    # this original's bbox + buffer
-                    ox_min, ox_max, oy_min, oy_max = orig_bboxes[orig_path]
-                    mask = (
-                        (cx >= ox_min - spatial_buffer) & (cx <= ox_max + spatial_buffer) &
-                        (cy >= oy_min - spatial_buffer) & (cy <= oy_max + spatial_buffer)
-                    )
-                    if not mask.any():
-                        continue
+            def _load_subset(orig_path: Path):
+                ox_min, ox_max, oy_min, oy_max = orig_bboxes[orig_path]
+                mask = (
+                    (cx >= ox_min - spatial_buffer) & (cx <= ox_max + spatial_buffer) &
+                    (cy >= oy_min - spatial_buffer) & (cy <= oy_max + spatial_buffer)
+                )
+                if not mask.any():
+                    return orig_path, None
 
-                    query_idx = np.where(mask)[0]
-                    query_pts = chunk_pts[query_idx]
-                    query_bounds = (
-                        float(cx[query_idx].min()),
-                        float(cx[query_idx].max()),
-                        float(cy[query_idx].min()),
-                        float(cy[query_idx].max()),
-                    )
+                query_idx = np.where(mask)[0]
+                query_bounds = (
+                    float(cx[query_idx].min()),
+                    float(cx[query_idx].max()),
+                    float(cy[query_idx].min()),
+                    float(cy[query_idx].max()),
+                )
+                load_start = _time.monotonic()
+                tree, dim_arrays = cache.load(
+                    orig_path,
+                    orig_dim_to_read,
+                    dims_to_add,
+                    query_bounds,
+                    max_dist,
+                )
+                load_dt = _time.monotonic() - load_start
+                return orig_path, (query_idx, tree, dim_arrays, load_dt)
 
-                    # Load only the local subset of the original file that could
-                    # possibly match this query window.
-                    try:
-                        cache_start = _time.monotonic()
-                        tree, dim_arrays = cache.load(
-                            orig_path,
-                            orig_dim_to_read,
-                            dims_to_add,
-                            query_bounds,
-                            max_dist,
-                        )
-                        cache_dt += _time.monotonic() - cache_start
-                    except Exception as e:
-                        print(f"    Warning: could not load {orig_path.name}: {e}", flush=True)
-                        continue
-
-                    if tree is None:
-                        del query_idx, query_pts, mask
-                        continue
-
-                    query_start = _time.monotonic()
-                    distances, orig_idx = tree.query(query_pts, k=1, workers=-1)
-                    if distances.ndim == 2:
-                        distances = distances[:, 0]
-                        orig_idx = orig_idx[:, 0]
-
-                    # Accept within tolerance AND closer than current best
-                    accept = (distances <= max_dist) & (distances < best_dist[query_idx])
-                    if not accept.any():
-                        del query_idx, query_pts, distances, orig_idx, mask, accept
-                        continue
-
-                    acc_chunk_idx = query_idx[accept]
-                    acc_orig_idx = orig_idx[accept]
-                    best_dist[acc_chunk_idx] = distances[accept]
-
-                    for name, dim_arr in dim_arrays.items():
-                        if name in best_dims:
-                            best_dims[name][acc_chunk_idx] = dim_arr[acc_orig_idx]
-                    query_dt += _time.monotonic() - query_start
-
-                    del query_idx, query_pts, distances, orig_idx, mask, accept
-                    del acc_chunk_idx, acc_orig_idx
-
-                # Build output point record for this chunk
-                write_start = _time.monotonic()
-                point_record = laspy.ScaleAwarePointRecord.zeros(n, header=out_header)
-                # Copy all existing dims from merged chunk
-                for dim_name in merged_dim_names:
-                    try:
-                        setattr(point_record, dim_name, getattr(chunk, dim_name))
-                    except Exception:
-                        pass
-                # Set new/overwritten dims from best matches
-                for name, arr in best_dims.items():
-                    if name in out_dim_names:
+            loaded_subsets: Dict[Path, Tuple[np.ndarray, Optional[cKDTree], Dict[str, np.ndarray], float]] = {}
+            if overlapping:
+                if query_workers > 1 and len(overlapping) > 1:
+                    with ThreadPoolExecutor(max_workers=min(query_workers, len(overlapping))) as executor:
+                        future_to_path = {
+                            executor.submit(_load_subset, orig_path): orig_path
+                            for orig_path in overlapping
+                        }
+                        for future in as_completed(future_to_path):
+                            orig_path = future_to_path[future]
+                            try:
+                                loaded = future.result()
+                            except Exception as e:
+                                print(f"    Warning: could not load {orig_path.name}: {e}", flush=True)
+                                continue
+                            if loaded[1] is not None:
+                                loaded_subsets[loaded[0]] = loaded[1]
+                else:
+                    for orig_path in overlapping:
                         try:
-                            target_dtype = getattr(point_record, name).dtype
-                            if arr.dtype != target_dtype:
-                                arr = arr.astype(target_dtype)
-                        except (AttributeError, KeyError, TypeError):
-                            pass
-                        setattr(point_record, name, arr)
+                            loaded = _load_subset(orig_path)
+                        except Exception as e:
+                            print(f"    Warning: could not load {orig_path.name}: {e}", flush=True)
+                            continue
+                        if loaded[1] is not None:
+                            loaded_subsets[loaded[0]] = loaded[1]
 
-                writer.write_points(point_record)
-                write_dt = _time.monotonic() - write_start
+            for orig_path in overlapping:
+                loaded = loaded_subsets.get(orig_path)
+                if loaded is None:
+                    continue
 
-                matched_in_chunk = int((best_dist < np.inf).sum())
-                total_matched += matched_in_chunk
-                total_written += n
-                chunk_dt = _time.monotonic() - t_chunk
-                elapsed = _time.monotonic() - t_start
-                pct = total_written / n_merged * 100
-                rate = total_written / elapsed if elapsed > 0 else 0
-                eta = (n_merged - total_written) / rate if rate > 0 else 0
+                query_idx, tree, dim_arrays, load_dt = loaded
+                subset_prep_dt += load_dt
+                if tree is None:
+                    continue
 
-                overlap_names = ", ".join(p.name for p in overlapping) if overlapping else "none"
-                print(f"  Chunk {chunk_num}/{n_chunks}: {n:,} pts, "
-                      f"{matched_in_chunk:,} matched ({len(overlapping)} originals: {overlap_names}), "
-                      f"{chunk_dt:.1f}s", flush=True)
+                query_pts = chunk_pts[query_idx]
+
+                query_start = _time.monotonic()
+                distances, orig_idx = tree.query(query_pts, k=1, workers=-1)
+                if distances.ndim == 2:
+                    distances = distances[:, 0]
+                    orig_idx = orig_idx[:, 0]
+
+                accept = (distances <= max_dist) & (distances < best_dist[query_idx])
+                if not accept.any():
+                    del query_idx, query_pts, distances, orig_idx, accept
+                    continue
+
+                acc_chunk_idx = query_idx[accept]
+                acc_orig_idx = orig_idx[accept]
+                best_dist[acc_chunk_idx] = distances[accept]
+
+                for name, dim_arr in dim_arrays.items():
+                    if name in best_dims:
+                        best_dims[name][acc_chunk_idx] = dim_arr[acc_orig_idx]
+                query_dt += _time.monotonic() - query_start
+
+                del query_idx, query_pts, distances, orig_idx, accept
+                del acc_chunk_idx, acc_orig_idx
+                del tree
+                for v in dim_arrays.values():
+                    del v
+                dim_arrays.clear()
+
+            write_start = _time.monotonic()
+            point_record = laspy.ScaleAwarePointRecord.zeros(n, header=out_header)
+            for dim_name in merged_dim_names:
+                try:
+                    arr = merged_dim_getter(dim_name)
+                    if arr is not None:
+                        setattr(point_record, dim_name, arr)
+                except Exception:
+                    pass
+            for name, arr in best_dims.items():
+                if name in out_dim_names:
+                    try:
+                        target_dtype = getattr(point_record, name).dtype
+                        if arr.dtype != target_dtype:
+                            arr = arr.astype(target_dtype)
+                    except (AttributeError, KeyError, TypeError):
+                        pass
+                    setattr(point_record, name, arr)
+
+            writer.write_points(point_record)
+            write_dt = _time.monotonic() - write_start
+
+            matched_in_chunk = int((best_dist < np.inf).sum())
+            total_matched += matched_in_chunk
+            total_written += n
+            chunk_dt = _time.monotonic() - t_chunk
+            elapsed = _time.monotonic() - t_start
+            pct = total_written / n_merged * 100
+            rate = total_written / elapsed if elapsed > 0 else 0
+            eta = (n_merged - total_written) / rate if rate > 0 else 0
+
+            overlap_names = ", ".join(p.name for p in overlapping) if overlapping else "none"
+            if subset_count is not None:
                 print(
-                    f"    Timings: overlap {overlap_dt:.1f}s, cache {cache_dt:.1f}s, "
-                    f"query/match {query_dt:.1f}s, write {write_dt:.1f}s",
+                    f"  {label}: {n:,} core pts from {subset_count:,} in-bounds, "
+                    f"{matched_in_chunk:,} matched ({len(overlapping)} originals: {overlap_names}), "
+                    f"{chunk_dt:.1f}s",
                     flush=True,
                 )
-                print(f"    Progress: {total_written:,}/{n_merged:,} ({pct:.1f}%), "
-                      f"elapsed {elapsed:.0f}s, ETA {eta:.0f}s, "
-                      f"rate {rate:,.0f} pts/s", flush=True)
+            else:
+                print(
+                    f"  {label}: {n:,} pts, {matched_in_chunk:,} matched "
+                    f"({len(overlapping)} originals: {overlap_names}), {chunk_dt:.1f}s",
+                    flush=True,
+                )
+            print(
+                f"    Timings: overlap {overlap_dt:.1f}s, subset prep {subset_prep_dt:.1f}s, "
+                f"query/match {query_dt:.1f}s, write {write_dt:.1f}s",
+                flush=True,
+            )
+            print(
+                f"    Progress: {total_written:,}/{n_merged:,} ({pct:.1f}%), "
+                f"elapsed {elapsed:.0f}s, ETA {eta:.0f}s, rate {rate:,.0f} pts/s",
+                flush=True,
+            )
 
-                del best_dist, best_dims, chunk_pts, point_record, cx, cy, cz
+            del best_dist, best_dims, chunk_pts, point_record
+
+        if merged_is_copc:
+            for slice_idx, (slice_bounds, axis, include_upper) in enumerate(slice_specs, start=1):
+                unit_num += 1
+                subset, subset_count = _load_copc_subset_all_dims(
+                    merged_laz,
+                    slice_bounds,
+                    halo=0.0,
+                    work_dir=tmp_dir,
+                )
+                if subset is None or subset_count == 0:
+                    print(f"  Slice {slice_idx}/{len(slice_specs)}: empty merged subset", flush=True)
+                    continue
+
+                sx = np.asarray(subset.x, dtype=np.float64)
+                sy = np.asarray(subset.y, dtype=np.float64)
+                sz = np.asarray(subset.z, dtype=np.float64)
+                if axis == "x":
+                    upper_mask = sx <= slice_bounds[1] if include_upper else sx < slice_bounds[1]
+                    core_mask = (
+                        (sx >= slice_bounds[0]) & upper_mask
+                        & (sy >= slice_bounds[2]) & (sy <= slice_bounds[3])
+                    )
+                else:
+                    upper_mask = sy <= slice_bounds[3] if include_upper else sy < slice_bounds[3]
+                    core_mask = (
+                        (sx >= slice_bounds[0]) & (sx <= slice_bounds[1])
+                        & (sy >= slice_bounds[2]) & upper_mask
+                    )
+                if not np.any(core_mask):
+                    print(f"  Slice {slice_idx}/{len(slice_specs)}: no core points after crop", flush=True)
+                    del subset, sx, sy, sz
+                    continue
+
+                def _slice_dim_getter(dim_name, _subset=subset, _mask=core_mask):
+                    arr = getattr(_subset, dim_name, None)
+                    return None if arr is None else np.asarray(arr)[_mask]
+
+                _process_block(
+                    f"Slice {slice_idx}/{len(slice_specs)}",
+                    sx[core_mask],
+                    sy[core_mask],
+                    sz[core_mask],
+                    _slice_dim_getter,
+                    subset_count=subset_count,
+                )
+                del subset, sx, sy, sz, core_mask
+        else:
+            with laspy.open(str(merged_laz), laz_backend=laspy.LazBackend.Lazrs) as reader:
+                for chunk in reader.chunk_iterator(CHUNK_SIZE):
+                    unit_num += 1
+                    cx = np.asarray(chunk.x, dtype=np.float64)
+                    cy = np.asarray(chunk.y, dtype=np.float64)
+                    cz = np.asarray(chunk.z, dtype=np.float64)
+
+                    def _chunk_dim_getter(dim_name, _chunk=chunk):
+                        return getattr(_chunk, dim_name, None)
+
+                    _process_block(
+                        f"Chunk {unit_num}/{n_chunks}",
+                        cx,
+                        cy,
+                        cz,
+                        _chunk_dim_getter,
+                    )
+                    del chunk, cx, cy, cz
 
     cache.clear()
     gc.collect()
@@ -3352,6 +3642,166 @@ def _add_original_dimensions_to_merged_impl(
 
 
 
+def _bounds_overlap_2d(
+    bounds_a: Tuple[float, float, float, float],
+    bounds_b: Tuple[float, float, float, float],
+    buffer: float = 0.0,
+) -> bool:
+    """Return True when two XY bboxes overlap, optionally with extra buffer."""
+    return not (
+        bounds_a[1] < bounds_b[0] - buffer
+        or bounds_a[0] > bounds_b[1] + buffer
+        or bounds_a[3] < bounds_b[2] - buffer
+        or bounds_a[2] > bounds_b[3] + buffer
+    )
+
+
+def _prepare_collection_remap_metadata(
+    collections: List[Path],
+    target_dims: Optional[Set[str]] = None,
+) -> List[dict]:
+    """Scan collection schemas once and cache file bounds for remap."""
+    seen_dim_names: Dict[str, int] = {}
+    collection_meta: List[dict] = []
+
+    for coll_path in collections:
+        coll_files = [coll_path] if coll_path.is_file() else list_pointcloud_files(coll_path)
+        dim_entries = []
+        scanned_names: set = set()
+        file_entries = []
+
+        for cf in coll_files:
+            try:
+                with laspy.open(str(cf), laz_backend=laspy.LazBackend.LazrsParallel) as f:
+                    hdr = f.header
+                    file_entries.append({
+                        "path": cf,
+                        "bounds": (hdr.x_min, hdr.x_max, hdr.y_min, hdr.y_max),
+                        "point_count": int(hdr.point_count),
+                        "is_copc": cf.name.endswith(".copc.laz"),
+                    })
+                    for dim in hdr.point_format.extra_dimensions:
+                        if dim.name in scanned_names:
+                            continue
+                        if target_dims is not None and dim.name not in target_dims:
+                            continue
+                        scanned_names.add(dim.name)
+                        out_name = dim.name
+                        count = seen_dim_names.get(dim.name, 0)
+                        if count > 0:
+                            out_name = f"{dim.name}_{count + 1}"
+                        seen_dim_names[dim.name] = count + 1
+                        dim_entries.append((
+                            dim.name,
+                            out_name,
+                            dim.dtype,
+                            extra_bytes_params_from_dimension_info(dim),
+                        ))
+            except Exception:
+                continue
+
+        collection_meta.append({
+            "path": coll_path,
+            "dim_entries": dim_entries,
+            "files": file_entries,
+            "all_copc": bool(file_entries) and all(entry["is_copc"] for entry in file_entries),
+        })
+
+    return collection_meta
+
+
+def _load_collection_subset_for_bounds(
+    coll_meta: dict,
+    query_bounds: Tuple[float, float, float, float],
+    spatial_buffer: float,
+    chunk_size: int,
+    work_dir: Optional[Path] = None,
+) -> Tuple[Optional[cKDTree], Dict[str, np.ndarray], int, int]:
+    """
+    Load only the subset of one collection needed for the current spatial window.
+
+    Returns ``(tree, dim_arrays, indexed_points, candidate_file_count)``.
+    """
+    orig_names = [entry[0] for entry in coll_meta["dim_entries"]]
+    if not orig_names:
+        return None, {}, 0, 0
+
+    candidate_files = [
+        entry for entry in coll_meta["files"]
+        if _bounds_overlap_2d(entry["bounds"], query_bounds, buffer=spatial_buffer)
+    ]
+    if not candidate_files:
+        return None, {}, 0, 0
+
+    pts_x: List[np.ndarray] = []
+    pts_y: List[np.ndarray] = []
+    pts_z: List[np.ndarray] = []
+    dim_bufs: Dict[str, List[np.ndarray]] = {name: [] for name in orig_names}
+
+    for file_entry in candidate_files:
+        cf = file_entry["path"]
+        if file_entry["is_copc"]:
+            subset, subset_count = _load_copc_subset_all_dims(
+                cf,
+                query_bounds,
+                halo=spatial_buffer,
+                work_dir=work_dir,
+            )
+            if subset is None or subset_count == 0:
+                continue
+            sx = np.asarray(subset.x)
+            if sx.size == 0:
+                del subset
+                continue
+            pts_x.append(sx)
+            pts_y.append(np.asarray(subset.y))
+            pts_z.append(np.asarray(subset.z))
+            for orig_name in orig_names:
+                arr = getattr(subset, orig_name, None)
+                if arr is not None:
+                    dim_bufs[orig_name].append(np.asarray(arr))
+                else:
+                    dim_bufs[orig_name].append(np.zeros(len(sx), dtype=np.float32))
+            del subset
+            continue
+
+        with laspy.open(str(cf), laz_backend=laspy.LazBackend.LazrsParallel) as f:
+            has_dims = {d.name for d in f.header.point_format.extra_dimensions}
+            for chunk in f.chunk_iterator(chunk_size):
+                cx = np.asarray(chunk.x)
+                cy = np.asarray(chunk.y)
+                mask = (
+                    (cx >= query_bounds[0] - spatial_buffer)
+                    & (cx <= query_bounds[1] + spatial_buffer)
+                    & (cy >= query_bounds[2] - spatial_buffer)
+                    & (cy <= query_bounds[3] + spatial_buffer)
+                )
+                if not mask.any():
+                    continue
+                pts_x.append(cx[mask])
+                pts_y.append(cy[mask])
+                pts_z.append(np.asarray(chunk.z)[mask])
+                for orig_name in orig_names:
+                    if orig_name in has_dims:
+                        dim_bufs[orig_name].append(np.asarray(getattr(chunk, orig_name))[mask])
+                    else:
+                        dim_bufs[orig_name].append(np.zeros(int(mask.sum()), dtype=np.float32))
+
+    if not pts_x:
+        return None, {}, 0, len(candidate_files)
+
+    xyz = np.column_stack([
+        np.concatenate(pts_x),
+        np.concatenate(pts_y),
+        np.concatenate(pts_z),
+    ])
+    dim_arrs = {name: np.concatenate(dim_bufs[name]) for name in orig_names}
+    tree = cKDTree(xyz)
+    n_points = len(xyz)
+    del xyz
+    return tree, dim_arrs, n_points, len(candidate_files)
+
+
 def remap_collections_to_original_files(
     collections: List[Path],
     original_input_dir: Path,
@@ -3360,6 +3810,9 @@ def remap_collections_to_original_files(
     retile_buffer: float = 2.0,
     chunk_size: int = 1_000_000,
     target_dims: Optional[Set[str]] = None,
+    spatial_slices: int = 50,
+    spatial_chunk_length: Optional[float] = None,
+    spatial_target_points: Optional[int] = None,
 ) -> None:
     """Remap N segmented collections onto original input files in a single pass per file.
 
@@ -3378,7 +3831,6 @@ def remap_collections_to_original_files(
         retile_buffer:      Extra spatial buffer around each original file's bounds.
         chunk_size:         Points per streaming chunk.
     """
-    from scipy.spatial import cKDTree
     import time as _time
 
     print(f"\n{'=' * 60}", flush=True)
@@ -3392,43 +3844,10 @@ def remap_collections_to_original_files(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     spatial_buffer = tolerance * 2 + retile_buffer
+    collection_meta = _prepare_collection_remap_metadata(collections, target_dims=target_dims)
 
-    # ── Scan all collection headers once to determine dim names + collision renaming ──
-    # collection_dims[i] = list of (original_name, output_name, dtype, ExtraBytesParams)
-    seen_dim_names: Dict[str, int] = {}  # output_name -> count
-    collection_dim_maps: List[List[Tuple[str, str, np.dtype, "laspy.ExtraBytesParams"]]] = []
-
-    for coll_path in collections:
-        coll_files = [coll_path] if coll_path.is_file() else list_pointcloud_files(coll_path)
-        dim_entries = []
-        scanned_names: set = set()
-        for cf in coll_files:
-            try:
-                with laspy.open(str(cf), laz_backend=laspy.LazBackend.LazrsParallel) as f:
-                    for dim in f.header.point_format.extra_dimensions:
-                        if dim.name in scanned_names:
-                            continue
-                        if target_dims is not None and dim.name not in target_dims:
-                            continue
-                        scanned_names.add(dim.name)
-                        out_name = dim.name
-                        count = seen_dim_names.get(out_name, 0)
-                        if count > 0:
-                            out_name = f"{dim.name}_{count + 1}"
-                        seen_dim_names[dim.name] = count + 1
-                        dim_entries.append((
-                            dim.name,
-                            out_name,
-                            dim.dtype,
-                            extra_bytes_params_from_dimension_info(dim),
-                        ))
-            except Exception:
-                continue
-            if scanned_names:
-                break  # one file is enough to get dim schema
-        collection_dim_maps.append(dim_entries)
-
-    for ci, (coll_path, dim_entries) in enumerate(zip(collections, collection_dim_maps)):
+    for ci, coll_meta in enumerate(collection_meta):
+        dim_entries = coll_meta["dim_entries"]
         if dim_entries:
             mapped = ", ".join(
                 out_name if orig_name == out_name else f"{orig_name}->{out_name}"
@@ -3436,193 +3855,233 @@ def remap_collections_to_original_files(
             )
         else:
             mapped = "(no extra dimensions discovered)"
+        source_mode = "COPC subsets" if coll_meta["all_copc"] else "stream scan fallback"
         print(
-            f"  Collection {ci + 1} dims from {coll_path}: {mapped}",
+            f"  Collection {ci + 1} dims from {coll_meta['path']}: {mapped} [{source_mode}]",
             flush=True,
         )
 
-    # ── Process each original file ────────────────────────────────────────────
     skipped = 0
-    for fi, orig_file in enumerate(original_files):
-        output_name = orig_file.name.replace(".copc.laz", ".laz")
-        output_path = output_dir / output_name
-        if output_path.exists():
-            skipped += 1
-            continue
+    with tempfile.TemporaryDirectory(prefix="3dtrees_multicol_remap_") as tmp_dir_str:
+        tmp_dir = Path(tmp_dir_str)
 
-        t0 = _time.monotonic()
-        print(f"  [{fi + 1}/{len(original_files)}] {orig_file.name}...", flush=True)
+        for fi, orig_file in enumerate(original_files):
+            output_name = orig_file.name.replace(".copc.laz", ".laz")
+            output_path = output_dir / output_name
+            if output_path.exists():
+                skipped += 1
+                continue
 
-        try:
-            with laspy.open(str(orig_file), laz_backend=laspy.LazBackend.LazrsParallel) as f:
-                orig_header = f.header
-                orig_pf = orig_header.point_format
-                orig_bounds = (
-                    orig_header.x_min, orig_header.x_max,
-                    orig_header.y_min, orig_header.y_max,
-                )
-                n_orig = orig_header.point_count
+            t0 = _time.monotonic()
+            print(f"  [{fi + 1}/{len(original_files)}] {orig_file.name}...", flush=True)
 
-            # Build per-collection KDTree from spatial subset
-            coll_trees: List[Optional[cKDTree]] = []
-            coll_dim_arrays: List[Dict[str, np.ndarray]] = []
-
-            for ci, (coll_path, dim_entries) in enumerate(zip(collections, collection_dim_maps)):
-                coll_files = [coll_path] if coll_path.is_file() else list_pointcloud_files(coll_path)
-                orig_names = [e[0] for e in dim_entries]
-
-                pts_x, pts_y, pts_z = [], [], []
-                dim_bufs: Dict[str, List[np.ndarray]] = {n: [] for n in orig_names}
-
-                for cf in coll_files:
-                    try:
-                        with laspy.open(str(cf), laz_backend=laspy.LazBackend.LazrsParallel) as f:
-                            ch = f.header
-                            # Quick spatial pre-check against file header bounds
-                            if (ch.x_max < orig_bounds[0] - spatial_buffer or
-                                    ch.x_min > orig_bounds[1] + spatial_buffer or
-                                    ch.y_max < orig_bounds[2] - spatial_buffer or
-                                    ch.y_min > orig_bounds[3] + spatial_buffer):
-                                continue
-                            has_dims = {
-                                d.name for d in ch.point_format.extra_dimensions
-                            }
-                            for chunk in f.chunk_iterator(chunk_size):
-                                cx = np.asarray(chunk.x)
-                                cy = np.asarray(chunk.y)
-                                mask = (
-                                    (cx >= orig_bounds[0] - spatial_buffer) &
-                                    (cx <= orig_bounds[1] + spatial_buffer) &
-                                    (cy >= orig_bounds[2] - spatial_buffer) &
-                                    (cy <= orig_bounds[3] + spatial_buffer)
-                                )
-                                if not mask.any():
-                                    continue
-                                pts_x.append(cx[mask])
-                                pts_y.append(cy[mask])
-                                pts_z.append(np.asarray(chunk.z)[mask])
-                                for orig_name in orig_names:
-                                    if orig_name in has_dims:
-                                        dim_bufs[orig_name].append(
-                                            np.asarray(getattr(chunk, orig_name))[mask]
-                                        )
-                                    else:
-                                        dim_bufs[orig_name].append(
-                                            np.zeros(int(mask.sum()), dtype=np.float32)
-                                        )
-                    except Exception as e:
-                        print(f"    Warning: error reading {cf.name}: {e}", flush=True)
-
-                if pts_x:
-                    xyz = np.column_stack([
-                        np.concatenate(pts_x),
-                        np.concatenate(pts_y),
-                        np.concatenate(pts_z),
-                    ])
-                    tree = cKDTree(xyz)
-                    dim_arrs = {n: np.concatenate(dim_bufs[n]) for n in orig_names}
-                    n_indexed = len(xyz)
-                else:
-                    tree = None
-                    dim_arrs = {}
-                    n_indexed = 0
-
-                coll_trees.append(tree)
-                coll_dim_arrays.append(dim_arrs)
-                print(
-                    f"    Collection {ci + 1}: {n_indexed:,} pts indexed",
-                    flush=True,
-                )
-
-            # Build output header
-            out_header = laspy.LasHeader(
-                point_format=orig_pf.id,
-                version=orig_header.version,
-            )
-            out_header.offsets = orig_header.offsets
-            out_header.scales = orig_header.scales
-            new_extra_params = []
-            existing_out_names = set(orig_pf.dimension_names)
-            for dim in orig_pf.extra_dimensions:
-                new_extra_params.append(extra_bytes_params_from_dimension_info(dim))
-                existing_out_names.add(dim.name)
-            # Add dims from all collections
-            all_new_out_names = []
-            skipped_conflicting_dims = []
-            for dim_entries in collection_dim_maps:
-                for orig_name, out_name, dtype, ebp in dim_entries:
-                    if out_name in existing_out_names:
-                        skipped_conflicting_dims.append(out_name)
-                        continue
-                    renamed_ebp = laspy.ExtraBytesParams(
-                        name=out_name, type=dtype,
-                        description=ebp.description or "",
+            try:
+                with laspy.open(str(orig_file), laz_backend=laspy.LazBackend.LazrsParallel) as f:
+                    orig_header = f.header
+                    orig_pf = orig_header.point_format
+                    orig_bounds = (
+                        orig_header.x_min, orig_header.x_max,
+                        orig_header.y_min, orig_header.y_max,
                     )
-                    new_extra_params.append(renamed_ebp)
-                    all_new_out_names.append(out_name)
-                    existing_out_names.add(out_name)
-            out_header.add_extra_dims(new_extra_params)
-            added_dims_str = ", ".join(all_new_out_names) if all_new_out_names else "(none)"
-            skipped_dims_str = (
-                ", ".join(sorted(set(skipped_conflicting_dims)))
-                if skipped_conflicting_dims
-                else "(none)"
-            )
+                    n_orig = orig_header.point_count
 
-            n_out = 0
-            with laspy.open(str(orig_file), laz_backend=laspy.LazBackend.LazrsParallel) as reader:
+                out_header = laspy.LasHeader(
+                    point_format=orig_pf.id,
+                    version=orig_header.version,
+                )
+                out_header.offsets = orig_header.offsets
+                out_header.scales = orig_header.scales
+
+                new_extra_params = []
+                existing_out_names = set(orig_pf.dimension_names)
+                for dim in orig_pf.extra_dimensions:
+                    new_extra_params.append(extra_bytes_params_from_dimension_info(dim))
+                    existing_out_names.add(dim.name)
+
+                all_new_out_names = []
+                skipped_conflicting_dims = []
+                for coll_meta in collection_meta:
+                    for _, out_name, dtype, ebp in coll_meta["dim_entries"]:
+                        if out_name in existing_out_names:
+                            skipped_conflicting_dims.append(out_name)
+                            continue
+                        new_extra_params.append(laspy.ExtraBytesParams(
+                            name=out_name,
+                            type=dtype,
+                            description=ebp.description or "",
+                        ))
+                        all_new_out_names.append(out_name)
+                        existing_out_names.add(out_name)
+                out_header.add_extra_dims(new_extra_params)
+
+                added_dims_str = ", ".join(all_new_out_names) if all_new_out_names else "(none)"
+                skipped_dims_str = (
+                    ", ".join(sorted(set(skipped_conflicting_dims)))
+                    if skipped_conflicting_dims else "(none)"
+                )
+
+                n_out = 0
+                output_path.parent.mkdir(parents=True, exist_ok=True)
                 with laspy.open(
                     str(output_path), mode="w", header=out_header,
                     do_compress=True, laz_backend=laspy.LazBackend.LazrsParallel,
                 ) as writer:
-                    for chunk in reader.chunk_iterator(chunk_size):
-                        xyz_q = np.column_stack([
-                            np.asarray(chunk.x),
-                            np.asarray(chunk.y),
-                            np.asarray(chunk.z),
-                        ])
-                        out_chunk = laspy.ScaleAwarePointRecord.zeros(
-                            len(chunk), header=out_header
+                    if orig_file.name.endswith(".copc.laz"):
+                        slice_specs = _build_spatial_slices(
+                            orig_bounds,
+                            spatial_slices,
+                            spatial_chunk_length,
+                            spatial_target_points,
+                            n_orig,
                         )
-                        # Copy original dims
-                        for dim_name in orig_pf.dimension_names:
-                            try:
-                                setattr(out_chunk, dim_name, np.asarray(getattr(chunk, dim_name)))
-                            except Exception:
-                                pass
+                        slice_specs = _snap_spatial_slices_to_header_grid(slice_specs, orig_header)
+                        print(
+                            f"    Spatial slicing: {len(slice_specs)} slices along {slice_specs[0][1].upper()}",
+                            flush=True,
+                        )
 
-                        # Query each collection and fill new dims
-                        for ci, (tree, dim_arrs, dim_entries) in enumerate(
-                            zip(coll_trees, coll_dim_arrays, collection_dim_maps)
-                        ):
-                            if tree is None:
+                        for slice_idx, (slice_bounds, axis, include_upper) in enumerate(slice_specs, start=1):
+                            subset, subset_count = _load_copc_subset_all_dims(
+                                orig_file,
+                                slice_bounds,
+                                halo=1.0,
+                                work_dir=tmp_dir,
+                            )
+                            if subset is None or subset_count == 0:
+                                print(f"      Slice {slice_idx}/{len(slice_specs)}: empty original subset", flush=True)
                                 continue
-                            _, idxs = tree.query(xyz_q, workers=-1)
-                            for orig_name, out_name, dtype, _ in dim_entries:
-                                if orig_name not in dim_arrs:
+
+                            sx = np.asarray(subset.x)
+                            sy = np.asarray(subset.y)
+                            sz = np.asarray(subset.z)
+                            if axis == "x":
+                                upper_mask = sx <= slice_bounds[1] if include_upper else sx < slice_bounds[1]
+                                core_mask = (
+                                    (sx >= slice_bounds[0]) & upper_mask
+                                    & (sy >= slice_bounds[2]) & (sy <= slice_bounds[3])
+                                )
+                            else:
+                                upper_mask = sy <= slice_bounds[3] if include_upper else sy < slice_bounds[3]
+                                core_mask = (
+                                    (sx >= slice_bounds[0]) & (sx <= slice_bounds[1])
+                                    & (sy >= slice_bounds[2]) & upper_mask
+                                )
+                            if not np.any(core_mask):
+                                print(f"      Slice {slice_idx}/{len(slice_specs)}: no core points after halo crop", flush=True)
+                                del subset
+                                continue
+
+                            orig_xyz = np.column_stack([sx[core_mask], sy[core_mask], sz[core_mask]])
+                            out_chunk = laspy.ScaleAwarePointRecord.zeros(len(orig_xyz), header=out_header)
+                            for dim_name in orig_pf.dimension_names:
+                                arr = getattr(subset, dim_name, None)
+                                if arr is not None:
+                                    setattr(out_chunk, dim_name, np.asarray(arr)[core_mask])
+
+                            coll_summaries = []
+                            for ci, coll_meta in enumerate(collection_meta, start=1):
+                                tree, dim_arrs, n_indexed, candidate_count = _load_collection_subset_for_bounds(
+                                    coll_meta=coll_meta,
+                                    query_bounds=slice_bounds,
+                                    spatial_buffer=spatial_buffer,
+                                    chunk_size=chunk_size,
+                                    work_dir=tmp_dir,
+                                )
+                                coll_summaries.append(f"c{ci}:{n_indexed:,}/{candidate_count}")
+                                if tree is None:
                                     continue
-                                vals = dim_arrs[orig_name][idxs].astype(dtype)
-                                setattr(out_chunk, out_name, vals)
+                                _, idxs = tree.query(orig_xyz, workers=-1)
+                                for orig_name, out_name, dtype, _ in coll_meta["dim_entries"]:
+                                    if orig_name in dim_arrs:
+                                        setattr(out_chunk, out_name, dim_arrs[orig_name][idxs].astype(dtype))
+                                del tree, dim_arrs
 
-                        writer.write_points(out_chunk)
-                        n_out += len(chunk)
+                            writer.write_points(out_chunk)
+                            n_out += len(orig_xyz)
+                            pct = n_out / n_orig * 100 if n_orig else 100
+                            elapsed = _time.monotonic() - t0
+                            rate = n_out / elapsed if elapsed > 0 else 0
+                            print(
+                                f"      Slice {slice_idx}/{len(slice_specs)}: {len(orig_xyz):,} core pts from {subset_count:,} in-bounds "
+                                f"({pct:.0f}%, {rate:,.0f} pts/s) [{' '.join(coll_summaries)}]",
+                                flush=True,
+                            )
+                            del out_chunk, orig_xyz, subset, sx, sy, sz
+                            gc.collect()
+                    else:
+                        n_chunks_expected = (n_orig + chunk_size - 1) // chunk_size
+                        print(
+                            f"    Non-COPC original fallback: streaming {n_orig:,} pts in ~{n_chunks_expected} chunks",
+                            flush=True,
+                        )
+                        with laspy.open(str(orig_file), laz_backend=laspy.LazBackend.LazrsParallel) as reader:
+                            chunk_i = 0
+                            for chunk in reader.chunk_iterator(chunk_size):
+                                xyz_q = np.column_stack([
+                                    np.asarray(chunk.x),
+                                    np.asarray(chunk.y),
+                                    np.asarray(chunk.z),
+                                ])
+                                chunk_bounds = (
+                                    float(np.min(xyz_q[:, 0])),
+                                    float(np.max(xyz_q[:, 0])),
+                                    float(np.min(xyz_q[:, 1])),
+                                    float(np.max(xyz_q[:, 1])),
+                                )
+                                out_chunk = laspy.ScaleAwarePointRecord.zeros(len(chunk), header=out_header)
+                                for dim_name in orig_pf.dimension_names:
+                                    try:
+                                        setattr(out_chunk, dim_name, np.asarray(getattr(chunk, dim_name)))
+                                    except Exception:
+                                        pass
 
-            print(
-                f"    {n_orig:,} pts → {n_out:,} pts written "
-                f"({_time.monotonic() - t0:.1f}s)",
-                flush=True,
-            )
-            print(f"    Added dims: {added_dims_str}", flush=True)
-            if skipped_conflicting_dims:
+                                coll_summaries = []
+                                for ci, coll_meta in enumerate(collection_meta, start=1):
+                                    tree, dim_arrs, n_indexed, candidate_count = _load_collection_subset_for_bounds(
+                                        coll_meta=coll_meta,
+                                        query_bounds=chunk_bounds,
+                                        spatial_buffer=spatial_buffer,
+                                        chunk_size=chunk_size,
+                                        work_dir=tmp_dir,
+                                    )
+                                    coll_summaries.append(f"c{ci}:{n_indexed:,}/{candidate_count}")
+                                    if tree is None:
+                                        continue
+                                    _, idxs = tree.query(xyz_q, workers=-1)
+                                    for orig_name, out_name, dtype, _ in coll_meta["dim_entries"]:
+                                        if orig_name in dim_arrs:
+                                            setattr(out_chunk, out_name, dim_arrs[orig_name][idxs].astype(dtype))
+                                    del tree, dim_arrs
+
+                                writer.write_points(out_chunk)
+                                n_out += len(chunk)
+                                chunk_i += 1
+                                pct = n_out / n_orig * 100 if n_orig else 100
+                                elapsed = _time.monotonic() - t0
+                                rate = n_out / elapsed if elapsed > 0 else 0
+                                print(
+                                    f"      Chunk {chunk_i}/{n_chunks_expected}: {len(chunk):,} pts "
+                                    f"({pct:.0f}%, {rate:,.0f} pts/s) [{' '.join(coll_summaries)}]",
+                                    flush=True,
+                                )
+                                del out_chunk, xyz_q
+
                 print(
-                    f"    Skipped conflicting dims already present in original schema: {skipped_dims_str}",
+                    f"    {n_orig:,} pts → {n_out:,} pts written "
+                    f"({_time.monotonic() - t0:.1f}s)",
                     flush=True,
                 )
+                print(f"    Added dims: {added_dims_str}", flush=True)
+                if skipped_conflicting_dims:
+                    print(
+                        f"    Skipped conflicting dims already present in original schema: {skipped_dims_str}",
+                        flush=True,
+                    )
 
-        except Exception as e:
-            print(f"    Error processing {orig_file.name}: {e}", flush=True)
-            import traceback
-            traceback.print_exc()
+            except Exception as e:
+                print(f"    Error processing {orig_file.name}: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
 
     if skipped:
         print(f"  Skipped {skipped} already-processed files.", flush=True)
@@ -3639,6 +4098,9 @@ def add_original_dimensions_to_merged(
     num_threads: int = 4,
     target_dims: Optional[Set[str]] = None,
     merge_chunk_size: int = 2_000_000,
+    spatial_slices: int = 10,
+    spatial_chunk_length: Optional[float] = None,
+    spatial_target_points: Optional[int] = None,
 ) -> None:
     """
     Add dimensions from original input files to the merged point cloud by
@@ -3681,6 +4143,9 @@ def add_original_dimensions_to_merged(
             tolerance, retile_buffer, distance_threshold, target_dims, tmp_dir,
             num_threads=num_threads,
             merge_chunk_size=merge_chunk_size,
+            spatial_slices=spatial_slices,
+            spatial_chunk_length=spatial_chunk_length,
+            spatial_target_points=spatial_target_points,
         )
     finally:
         import shutil as _shutil
