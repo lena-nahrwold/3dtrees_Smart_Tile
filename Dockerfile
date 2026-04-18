@@ -20,8 +20,8 @@ RUN mamba install -n base -c conda-forge \
 RUN pip install --no-cache-dir uv
 
 # Python deps (all used):
-# laspy, lazrs – LAZ/LAS read/write (main_tile, main_subsample, merge_tiles, main_remap, filter_buffer_instances)
-# numpy, scipy – arrays and cKDTree (merge_tiles, main_remap)
+# laspy, lazrs – LAZ/LAS read/write (filter/remap pipeline, COPC helpers)
+# numpy, scipy – arrays and cKDTree (merge_tiles-based remap/filter logic)
 # matplotlib, fiona, pyproj – plot_tiles_and_copc.py, get_bounds_from_tindex.py, prepare_tile_jobs.py
 # pydantic, pydantic-settings – parameters.py
 RUN uv pip install --system \
@@ -72,13 +72,13 @@ ENV MPLCONFIGDIR="/tmp/matplotlib"
 # Build:
 #   docker build -t 3dtrees-smart-tile .
 #
-# Tile task:
+# Filter task:
 #   docker run -v /path/to/data:/data 3dtrees-smart-tile \
-#       --task tile --input_dir /data/input --output_dir /data/output
+#       --task filter --segmented-folders /data/segmented --tile-bounds-json /data/tile_bounds_tindex.json --output-dir /data/output
 #
-# Merge task:
+# Remap task:
 #   docker run -v /path/to/data:/data 3dtrees-smart-tile \
-#       --task merge --subsampled_10cm_folder /data/10cm
+#       --task remap --segmented-folders /data/segmented --original-input-dir /data/original --output-dir /data/output
 #
 # Show parameters:
 #   docker run 3dtrees-smart-tile --show-params

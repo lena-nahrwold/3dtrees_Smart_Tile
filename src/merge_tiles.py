@@ -48,30 +48,54 @@ sys.stdout.reconfigure(line_buffering=True)
 # =============================================================================
 # R/lidR → laspy dimension name mapping
 # =============================================================================
-# The standardization JSON (collection_summary.json from tool_standard) uses
-# R/lidR attribute names.  laspy uses LAS spec names.  Extra-byte dimensions
-# (e.g. Amplitude, Reflectance, Deviation) are the same in both systems and
-# fall through unchanged via the .get() default.
+# The standardization JSON (collection_summary.json from tool_standard) can mix
+# R/lidR names, LAS 1.2 names, LAS 1.4 names, and already-normalized laspy
+# names. Extra-byte dimensions (e.g. Amplitude, Reflectance, Deviation) are
+# preserved as-is and fall through unchanged via the .get() default.
+#
+# In particular, LAS 1.2 `ScanAngleRank` / laspy `scan_angle_rank` and LAS 1.4
+# `ScanAngle` / laspy `scan_angle` should all resolve to the same canonical
+# dimension used by the remap path: `scan_angle`.
 
-_R_TO_LASPY_NAME = {
+_DIMENSION_NAME_ALIASES = {
     "Intensity": "intensity",
+    "intensity": "intensity",
     "ReturnNumber": "return_number",
+    "return_number": "return_number",
     "NumberOfReturns": "number_of_returns",
+    "number_of_returns": "number_of_returns",
     "ScanDirectionFlag": "scan_direction_flag",
+    "scan_direction_flag": "scan_direction_flag",
     "EdgeOfFlightline": "edge_of_flight_line",
+    "edge_of_flight_line": "edge_of_flight_line",
     "Classification": "classification",
+    "classification": "classification",
     "ScannerChannel": "scanner_channel",
+    "scanner_channel": "scanner_channel",
     "Synthetic_flag": "synthetic",
+    "synthetic": "synthetic",
     "Keypoint_flag": "key_point",
+    "key_point": "key_point",
     "Withheld_flag": "withheld",
+    "withheld": "withheld",
     "Overlap_flag": "overlap",
+    "overlap": "overlap",
     "ScanAngle": "scan_angle",
+    "scan_angle": "scan_angle",
+    "ScanAngleRank": "scan_angle",
+    "scan_angle_rank": "scan_angle",
     "UserData": "user_data",
+    "user_data": "user_data",
     "PointSourceID": "point_source_id",
+    "point_source_id": "point_source_id",
     "gpstime": "gps_time",
+    "gps_time": "gps_time",
     "R": "red",
+    "red": "red",
     "G": "green",
+    "green": "green",
     "B": "blue",
+    "blue": "blue",
 }
 
 _RGB_STANDARD_DIMS = ("red", "green", "blue")
@@ -152,7 +176,7 @@ def load_standardization_dims(json_path: Path) -> Set[str]:
     for n in ref_names:
         if n in ("X", "Y", "Z"):
             continue
-        laspy_name = _R_TO_LASPY_NAME.get(n, n)
+        laspy_name = _DIMENSION_NAME_ALIASES.get(n, n)
         if has_variation and n not in has_variation:
             skipped.append(n)
             continue
@@ -181,7 +205,10 @@ class TileData:
 
 
 def normalize_tile_id(stem: str) -> str:
-    """Strip processing suffixes and return the base tile id."""
+    """Return the base tile id by extracting the c##_r## pattern if present."""
+    m = re.search(r"c\d+_r\d+", stem)
+    if m:
+        return m.group(0)
     return re.sub(
         r"(?:_segmented_remapped|_segmented|_remapped|_results|_subsampled_[\d.]+(?:cm|m))+$",
         "",
@@ -2978,6 +3005,7 @@ def _add_original_dimensions_to_merged_impl(
     retile_buffer: float,
     distance_threshold: Optional[float],
     target_dims: Optional[Set[str]],
+    source_extra_dims_to_keep: Optional[Set[str]],
     tmp_dir: Path,
     num_threads: int = 4,
     merge_chunk_size: int = 2_000_000,
@@ -3019,6 +3047,11 @@ def _add_original_dimensions_to_merged_impl(
         merged_point_format = merged_header.point_format
         merged_dim_names = set(merged_point_format.dimension_names)
         merged_extra_dims = list(merged_point_format.extra_dimensions)
+        if source_extra_dims_to_keep is not None:
+            merged_extra_dims = [
+                dim for dim in merged_extra_dims
+                if dim.name in source_extra_dims_to_keep
+            ]
     print(
         f"  Merged input: {n_merged:,} points, {len(merged_dim_names)} dimensions "
         f"({_time.monotonic() - phase_start:.1f}s)",
@@ -3660,7 +3693,13 @@ def _prepare_collection_remap_metadata(
     collections: List[Path],
     target_dims: Optional[Set[str]] = None,
 ) -> List[dict]:
-    """Scan collection schemas once and cache file bounds for remap."""
+    """
+    Scan collection schemas once and cache file bounds for remap.
+
+    When ``target_dims`` is omitted, only extra dimensions are exported from the
+    source collections. When it is provided, it is treated as a strict allowlist
+    and may include both extra and standard LAS dimensions.
+    """
     seen_dim_names: Dict[str, int] = {}
     collection_meta: List[dict] = []
 
@@ -3674,14 +3713,18 @@ def _prepare_collection_remap_metadata(
             try:
                 with laspy.open(str(cf), laz_backend=laspy.LazBackend.LazrsParallel) as f:
                     hdr = f.header
+                    extra_names = {dim.name for dim in hdr.point_format.extra_dimensions}
                     file_entries.append({
                         "path": cf,
                         "bounds": (hdr.x_min, hdr.x_max, hdr.y_min, hdr.y_max),
                         "point_count": int(hdr.point_count),
                         "is_copc": cf.name.endswith(".copc.laz"),
                     })
-                    for dim in hdr.point_format.extra_dimensions:
+                    for dim in hdr.point_format.dimensions:
                         if dim.name in scanned_names:
+                            continue
+                        is_standard_dim = dim.name not in extra_names
+                        if target_dims is None and is_standard_dim:
                             continue
                         if target_dims is not None and dim.name not in target_dims:
                             continue
@@ -3694,8 +3737,8 @@ def _prepare_collection_remap_metadata(
                         dim_entries.append((
                             dim.name,
                             out_name,
-                            dim.dtype,
-                            extra_bytes_params_from_dimension_info(dim),
+                            np.dtype(dim.dtype),
+                            None if is_standard_dim else extra_bytes_params_from_dimension_info(dim),
                         ))
             except Exception:
                 continue
@@ -3766,7 +3809,6 @@ def _load_collection_subset_for_bounds(
             continue
 
         with laspy.open(str(cf), laz_backend=laspy.LazBackend.LazrsParallel) as f:
-            has_dims = {d.name for d in f.header.point_format.extra_dimensions}
             for chunk in f.chunk_iterator(chunk_size):
                 cx = np.asarray(chunk.x)
                 cy = np.asarray(chunk.y)
@@ -3782,10 +3824,11 @@ def _load_collection_subset_for_bounds(
                 pts_y.append(cy[mask])
                 pts_z.append(np.asarray(chunk.z)[mask])
                 for orig_name in orig_names:
-                    if orig_name in has_dims:
-                        dim_bufs[orig_name].append(np.asarray(getattr(chunk, orig_name))[mask])
-                    else:
+                    arr = getattr(chunk, orig_name, None)
+                    if arr is None:
                         dim_bufs[orig_name].append(np.zeros(int(mask.sum()), dtype=np.float32))
+                    else:
+                        dim_bufs[orig_name].append(np.asarray(arr)[mask])
 
     if not pts_x:
         return None, {}, 0, len(candidate_files)
@@ -3854,7 +3897,7 @@ def remap_collections_to_original_files(
                 for orig_name, out_name, _, _ in dim_entries
             )
         else:
-            mapped = "(no extra dimensions discovered)"
+            mapped = "(no selected dimensions discovered)"
         source_mode = "COPC subsets" if coll_meta["all_copc"] else "stream scan fallback"
         print(
             f"  Collection {ci + 1} dims from {coll_meta['path']}: {mapped} [{source_mode}]",
@@ -3885,34 +3928,55 @@ def remap_collections_to_original_files(
                     )
                     n_orig = orig_header.point_count
 
-                out_header = laspy.LasHeader(
-                    point_format=orig_pf.id,
-                    version=orig_header.version,
-                )
-                out_header.offsets = orig_header.offsets
-                out_header.scales = orig_header.scales
-
+                all_output_dim_names = set(orig_pf.dimension_names)
                 new_extra_params = []
-                existing_out_names = set(orig_pf.dimension_names)
                 for dim in orig_pf.extra_dimensions:
                     new_extra_params.append(extra_bytes_params_from_dimension_info(dim))
-                    existing_out_names.add(dim.name)
+                    all_output_dim_names.add(dim.name)
 
                 all_new_out_names = []
                 skipped_conflicting_dims = []
                 for coll_meta in collection_meta:
                     for _, out_name, dtype, ebp in coll_meta["dim_entries"]:
-                        if out_name in existing_out_names:
+                        if out_name in all_output_dim_names:
+                            if ebp is None and out_name in orig_pf.dimension_names:
+                                continue
                             skipped_conflicting_dims.append(out_name)
                             continue
                         new_extra_params.append(laspy.ExtraBytesParams(
                             name=out_name,
                             type=dtype,
-                            description=ebp.description or "",
+                            description=(ebp.description or "") if ebp is not None else "",
                         ))
                         all_new_out_names.append(out_name)
-                        existing_out_names.add(out_name)
-                out_header.add_extra_dims(new_extra_params)
+                        all_output_dim_names.add(out_name)
+
+                promote_rgb = (
+                    has_standard_rgb_dims(all_output_dim_names)
+                    and not point_format_has_standard_rgb(orig_pf.id)
+                )
+                out_pf_id = point_format_with_standard_rgb(orig_pf.id) if promote_rgb else orig_pf.id
+
+                out_header = laspy.LasHeader(
+                    point_format=out_pf_id,
+                    version=orig_header.version,
+                )
+                out_header.offsets = orig_header.offsets
+                out_header.scales = orig_header.scales
+
+                filtered_extra_params = []
+                for ep in new_extra_params:
+                    if promote_rgb and ep.name in _RGB_STANDARD_DIMS:
+                        continue
+                    filtered_extra_params.append(ep)
+                out_header.add_extra_dims(filtered_extra_params)
+
+                if promote_rgb:
+                    print(
+                        f"    Promoting RGB to standard LAS fields: "
+                        f"point_format {orig_pf.id} -> {out_pf_id}",
+                        flush=True,
+                    )
 
                 added_dims_str = ", ".join(all_new_out_names) if all_new_out_names else "(none)"
                 skipped_dims_str = (
@@ -4140,7 +4204,7 @@ def add_original_dimensions_to_merged(
     try:
         return _add_original_dimensions_to_merged_impl(
             merged_laz, original_input_dir, output_path, original_files,
-            tolerance, retile_buffer, distance_threshold, target_dims, tmp_dir,
+            tolerance, retile_buffer, distance_threshold, target_dims, None, tmp_dir,
             num_threads=num_threads,
             merge_chunk_size=merge_chunk_size,
             spatial_slices=spatial_slices,
@@ -4151,6 +4215,122 @@ def add_original_dimensions_to_merged(
         import shutil as _shutil
         if tmp_dir.exists():
             _shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def enrich_collection_tiles_with_original_dimensions(
+    tile_collection: Path,
+    original_input_dir: Path,
+    output_dir: Path,
+    tolerance: float = 0.1,
+    retile_buffer: float = 2.0,
+    distance_threshold: Optional[float] = None,
+    num_threads: int = 4,
+    target_dims: Optional[Set[str]] = None,
+    source_extra_dims_to_keep: Optional[Set[str]] = None,
+    merge_chunk_size: int = 2_000_000,
+    spatial_slices: int = 10,
+    spatial_chunk_length: Optional[float] = None,
+    spatial_target_points: Optional[int] = None,
+) -> None:
+    """
+    Enrich a tile collection with original-file dimensions while keeping the
+    tile geometry unchanged.
+
+    Each input tile is processed independently with the same spatially chunked
+    enrichment logic used for merged-file enrichment. This keeps the duplicate-
+    free tile layout intact so the enriched outputs can be concatenated directly
+    without global overlap deduplication.
+    """
+    import time as _time
+
+    tile_collection = Path(tile_collection)
+    original_input_dir = Path(original_input_dir)
+    output_dir = Path(output_dir)
+
+    tile_files = [tile_collection] if tile_collection.is_file() else list_pointcloud_files(tile_collection)
+    if not tile_files:
+        print(f"  No tile files found in {tile_collection}; skipping tile enrichment.", flush=True)
+        return
+
+    original_files = list_pointcloud_files(original_input_dir)
+    if not original_files:
+        print("  No original input files found; skipping tile enrichment.", flush=True)
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"\n{'=' * 60}", flush=True)
+    print("Enriching tiled remap source with original-file dimensions", flush=True)
+    print(f"{'=' * 60}", flush=True)
+    print(f"  Tile source:  {tile_collection}", flush=True)
+    print(f"  Originals:    {original_input_dir}", flush=True)
+    print(f"  Output tiles: {output_dir}", flush=True)
+    print(f"  Tile count:   {len(tile_files)}", flush=True)
+
+    def _fmt_elapsed(seconds: float) -> str:
+        if seconds < 60:
+            return f"{seconds:.1f}s"
+        return f"{seconds / 60:.1f} min"
+
+    skipped = 0
+    total_start = _time.monotonic()
+    for idx, tile_path in enumerate(tile_files, start=1):
+        output_name = tile_path.name.replace(".copc.laz", ".laz")
+        output_path = output_dir / output_name
+        if output_path.resolve() == tile_path.resolve():
+            raise ValueError(
+                f"Tile enrichment output would overwrite input tile: {tile_path}"
+            )
+        if output_path.exists():
+            skipped += 1
+            print(
+                f"  [{idx}/{len(tile_files)}] {tile_path.name}: output already exists, skipping",
+                flush=True,
+            )
+            continue
+
+        tile_start = _time.monotonic()
+        print(
+            f"\n  [{idx}/{len(tile_files)}] Enriching tile {tile_path.name} "
+            f"→ {output_name}",
+            flush=True,
+        )
+        tmp_dir = output_dir / f"_enrich_tmp_{os.getpid()}_{idx:04d}"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            _add_original_dimensions_to_merged_impl(
+                merged_laz=tile_path,
+                original_input_dir=original_input_dir,
+                output_path=output_path,
+                original_files=original_files,
+                tolerance=tolerance,
+                retile_buffer=retile_buffer,
+                distance_threshold=distance_threshold,
+                target_dims=target_dims,
+                source_extra_dims_to_keep=source_extra_dims_to_keep,
+                tmp_dir=tmp_dir,
+                num_threads=num_threads,
+                merge_chunk_size=merge_chunk_size,
+                spatial_slices=spatial_slices,
+                spatial_chunk_length=spatial_chunk_length,
+                spatial_target_points=spatial_target_points,
+            )
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        print(
+            f"  [{idx}/{len(tile_files)}] Tile enrichment finished in "
+            f"{_fmt_elapsed(_time.monotonic() - tile_start)}",
+            flush=True,
+        )
+
+    if skipped:
+        print(f"  Skipped {skipped} already-enriched tile(s).", flush=True)
+    total_elapsed = _time.monotonic() - total_start
+    print(
+        f"  Tile enrichment complete in {_fmt_elapsed(total_elapsed)}",
+        flush=True,
+    )
 
 
 # =============================================================================

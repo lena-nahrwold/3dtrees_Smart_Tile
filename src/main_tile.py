@@ -631,6 +631,18 @@ def _distribute_source_file(args: Tuple) -> Tuple[List[Tuple[str, int]], str]:
 
     source_idx, src_file, overlapping_tiles, tiles_dir, decompress_threads, chunk_size = args
 
+    # Skip tiles that already have the part file for this source to avoid
+    # regenerating intermediate LAS chunks during reruns/resumes.
+    pending_overlaps: List[Tuple[str, Tuple[float, float, float, float]]] = []
+    for label, bounds in overlapping_tiles:
+        part_file = Path(tiles_dir) / label / f"part_{source_idx}.las"
+        if part_file.exists() and part_file.stat().st_size > 0:
+            continue
+        pending_overlaps.append((label, bounds))
+    if not pending_overlaps:
+        return ([], "all parts already present")
+    overlapping_tiles = pending_overlaps
+
     # So LazrsParallel (Rayon) uses N threads for chunk decompression
     if decompress_threads and decompress_threads > 0:
         os.environ["RAYON_NUM_THREADS"] = str(decompress_threads)
@@ -801,6 +813,18 @@ def _finalize_tile_to_copc(args: Tuple) -> Tuple[str, bool, str]:
         return (label, False, str(e))
 
 
+def _read_copc_point_count(path: Path) -> Optional[int]:
+    """Return the point count from a COPC header, or None when unavailable."""
+    try:
+        if not path.exists():
+            return None
+        import laspy
+        with laspy.open(str(path)) as reader:
+            return int(reader.header.point_count)
+    except Exception:
+        return None
+
+
 def _finalize_tile_to_copc_pdal(
     parts: List[Path],
     final_tile: Path,
@@ -948,8 +972,15 @@ def _convert_laz_to_copc_direct(input_laz: Path, output_copc: Path) -> Tuple[boo
         success = r.returncode == 0 and output_copc.exists() and output_copc.stat().st_size > 0
         if success:
             return (True, "untwine direct")
-        stderr = (r.stderr or r.stdout or "unknown error").strip()
-        return (False, stderr[:200] or "untwine direct conversion failed")
+        stderr = (r.stderr or r.stdout or "").strip()
+        if r.returncode < 0:
+            signal_msg = f"terminated by signal {-r.returncode}"
+        elif r.returncode > 128:
+            signal_msg = f"terminated by signal {r.returncode - 128}"
+        else:
+            signal_msg = f"rc={r.returncode}"
+        detail = stderr[:200] if stderr else "unknown error"
+        return (False, f"{signal_msg}: {detail}")
     except Exception as e:
         return (False, str(e))
 
@@ -1013,7 +1044,26 @@ def _convert_laz_to_copc(
             output_copc=output_copc,
             chunk_size=chunk_size,
         )
-    return _convert_laz_to_copc_direct(input_laz, output_copc)
+    direct_success, direct_message = _convert_laz_to_copc_direct(input_laz, output_copc)
+    if direct_success:
+        return (True, direct_message)
+
+    output_copc.unlink(missing_ok=True)
+    chunked_success, chunked_message = _convert_laz_to_copc_chunked(
+        input_laz=input_laz,
+        output_copc=output_copc,
+        chunk_size=chunk_size,
+    )
+    if chunked_success:
+        return (
+            True,
+            f"chunked fallback after direct untwine failure ({direct_message})",
+        )
+    return (
+        False,
+        "direct untwine failed "
+        f"({direct_message}); chunked fallback failed ({chunked_message})",
+    )
 
 
 def ensure_copc_sources(
@@ -1263,11 +1313,17 @@ def create_tiles(
         }
         for future in as_completed(futures):
             label, success, message = future.result()
-            pts = tile_point_counts.get(label, 0)
+            final_tile = tiles_dir / f"{label}.copc.laz"
+            pts = _read_copc_point_count(final_tile)
+            if pts is None:
+                pts = tile_point_counts.get(label, 0)
             if success:
                 if "Already exists" in message or "No data" in message:
                     skipped += 1
-                    print(f"    - {label}: {message}")
+                    if "No data" in message:
+                        print(f"    - {label}: {message}")
+                    else:
+                        print(f"    - {label}: {message} ({pts:,} pts)")
                 else:
                     successful += 1
                     print(f"    ✓ {label}: {message} ({pts:,} pts)")
