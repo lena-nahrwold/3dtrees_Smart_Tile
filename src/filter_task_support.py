@@ -60,6 +60,7 @@ _TREE_FILE_PATTERNS: Tuple[re.Pattern[str], ...] = (
     re.compile(r"^.+_trees(?:_[^.]+)?\.txt$", re.IGNORECASE),
     re.compile(r"^.+_trees_info(?:_[^.]+)?\.txt$", re.IGNORECASE),
 )
+_TILE_ID_PATTERN: re.Pattern[str] = re.compile(r"c\d+_r\d+", re.IGNORECASE)
 
 
 def dir_has_pointcloud_outputs(directory: Path) -> bool:
@@ -74,9 +75,12 @@ def is_pointcloud_file(path: Path) -> bool:
 
 
 def is_tree_sidecar_file(path: Path) -> bool:
-    """Return True for supported tree sidecar text files."""
-    name = Path(path).name
-    return any(pattern.match(name) for pattern in _TREE_FILE_PATTERNS)
+    """Return True for tree sidecar text files."""
+    path = Path(path)
+    name = path.name
+    if any(pattern.match(name) for pattern in _TREE_FILE_PATTERNS):
+        return True
+    return path.suffix.lower() == ".txt"
 
 
 def classify_tree_sidecar_file(path: Path) -> Optional[str]:
@@ -95,6 +99,41 @@ def _collection_file_key(path: Path, pointcloud_key_fn: Callable[[Path], str]) -
 
     raw_key = pointcloud_key_fn(Path(path))
     return normalize_tile_id(raw_key)
+
+
+def _tree_sidecar_tile_key(path: Path) -> Optional[str]:
+    """
+    Return the normalized tile id embedded in a tree-sidecar filename.
+
+    This accepts generic per-tile text sidecars such as
+    ``c00_r00_subsampled_10cm.txt`` in addition to explicit ``*_trees.txt``
+    filenames.
+    """
+    from merge_tiles import normalize_tile_id
+
+    path = Path(path)
+    if path.suffix.lower() != ".txt" or not _TILE_ID_PATTERN.search(path.stem):
+        return None
+    return normalize_tile_id(path.stem)
+
+
+def _normalize_tile_key(value: str) -> str:
+    """Normalize an arbitrary tile-like label to its canonical tile id."""
+    from merge_tiles import normalize_tile_id
+
+    return normalize_tile_id(str(value))
+
+
+def _strip_tree_matching_suffixes(value: str) -> str:
+    """Strip common processing suffixes so tree and pointcloud stems can match."""
+    value = str(value).strip()
+    value = re.sub(r"_\d+$", "", value)
+    return re.sub(
+        r"(?:_(?:trees_info|trees|segmented_remapped|segmented|remapped|results|subsampled_[\d.]+(?:cm|m))(?:_\d+)?)+$",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    )
 
 
 def discover_tree_sidecars_for_pointcloud(
@@ -149,6 +188,21 @@ def discover_tree_sidecars_for_pointcloud(
         stem_no_proc,
         _collection_file_key(pointcloud_path, pointcloud_key_fn),
     )
+    candidate_tile_keys = {
+        _normalize_tile_key(base)
+        for base in candidate_bases
+        if _TILE_ID_PATTERN.search(str(base))
+    }
+    candidate_generic_bases = {
+        str(base).strip().lower()
+        for base in candidate_bases
+        if str(base).strip()
+    }
+    candidate_generic_bases.update(
+        _strip_tree_matching_suffixes(base).lower()
+        for base in candidate_bases
+        if _strip_tree_matching_suffixes(base)
+    )
 
     matched: Dict[str, Path] = {}
     pointcloud_lower = pointcloud_path.name.lower()
@@ -193,6 +247,19 @@ def discover_tree_sidecars_for_pointcloud(
             ):
                 matched.setdefault(suffix, txt_path)
                 break
+        else:
+            txt_tile_key = _tree_sidecar_tile_key(txt_path)
+            if txt_tile_key and txt_tile_key in candidate_tile_keys:
+                matched.setdefault(tree_kind, txt_path)
+                continue
+
+            txt_generic_bases = {
+                txt_path.stem.lower(),
+                _strip_tree_matching_suffixes(txt_path.stem).lower(),
+            }
+            txt_generic_bases.discard("")
+            if txt_generic_bases & candidate_generic_bases:
+                matched.setdefault(tree_kind, txt_path)
 
     return matched
 
