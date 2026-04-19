@@ -597,6 +597,22 @@ def _pointcloud_file_key(path: Path) -> str:
     return path.name[:-9] if path.name.endswith(".copc.laz") else path.stem
 
 
+def _collection_match_key(path: Path, collection_idx: int, strip_collection_suffix: bool = False) -> str:
+    """
+    Return the tile key used to compare files across remap collections.
+
+    Galaxy remap inputs are symlinked as ``<original_stem>_<collection_idx>.<ext>``.
+    When every file in a collection follows that pattern, the trailing wrapper
+    suffix should be ignored for aligned-fusion matching.
+    """
+    key = _pointcloud_file_key(path)
+    if strip_collection_suffix:
+        suffix = f"_{collection_idx}"
+        if key.endswith(suffix):
+            return key[: -len(suffix)]
+    return key
+
+
 def _fusion_key_dims() -> List[str]:
     """Return the point-identity key used for attribute fusion."""
     return ["X", "Y", "Z"]
@@ -1323,9 +1339,18 @@ def _fuse_aligned_collections_to_copc(
             print(f"  Fusion check: collection {idx} has no files in {coll_path}")
             return None
 
+        collection_suffix = f"_{idx}"
+        strip_collection_suffix = all(
+            _pointcloud_file_key(src).endswith(collection_suffix)
+            for src in files
+        )
         key_map = {}
         for src in files:
-            key = _pointcloud_file_key(src)
+            key = _collection_match_key(
+                src,
+                collection_idx=idx,
+                strip_collection_suffix=strip_collection_suffix,
+            )
             if key in key_map:
                 print(
                     f"  Fusion check: duplicate tile key '{key}' in collection {idx} ({coll_path}); "
