@@ -78,6 +78,11 @@ class Parameters(BaseSettings):
         description="Write res1 subsampling outputs as COPC ('.copc.laz') instead of standard LAZ ('.laz').",
         validation_alias=AliasChoices("output-copc-res1", "output_copc_res1"),
     )
+    output_copc_res2: bool = Field(
+        default=False,
+        description="Write res2 subsampling outputs as COPC ('.copc.laz') instead of standard LAZ ('.laz').",
+        validation_alias=AliasChoices("output-copc-res2", "output_copc_res2"),
+    )
     dimension_reduction: bool = Field(
         default=True,
         description="Reduce subsampled outputs to minimal LAS dimensions for smaller files.",
@@ -224,6 +229,7 @@ def print_params(params: Parameters):
     print(f"tile_length: {params.tile_length}")
     print(f"tile_buffer: {params.tile_buffer}")
     print(f"output_copc_res1: {params.output_copc_res1}")
+    print(f"output_copc_res2: {params.output_copc_res2}")
     print(f"threads: {params.threads}")
     print(f"resolution_1: {params.resolution_1}")
     print(f"resolution_2: {params.resolution_2}")

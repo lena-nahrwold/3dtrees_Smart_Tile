@@ -77,6 +77,7 @@ def preprocess_boolean_flags(args_list):
         "--dimension-reduction", "--dimension_reduction",
         "--skip-dimension-reduction", "--skip_dimension_reduction",
         "--output-copc-res1", "--output_copc_res1",
+        "--output-copc-res2", "--output_copc_res2",
         "--chunkwise-copc-source-creation", "--chunkwise_copc_source_creation",
         "--enable-volume-merge", "--enable_volume_merge",
         "--produce-merged-file", "--produce_merged_file",

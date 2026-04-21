@@ -20,7 +20,7 @@ import tempfile
 import numpy as np
 import laspy
 from pathlib import Path
-from typing import Dict, List, Tuple, Set, Optional
+from typing import Any, Dict, List, Tuple, Set, Optional
 from collections import defaultdict
 from dataclasses import dataclass
 
@@ -1631,7 +1631,7 @@ def write_filtered_tiles_streaming(
     chunk_size: int = 1_000_000,
     filter_anchor: str = "centroid",
     global_to_merged: Optional[Dict[int, int]] = None,
-) -> None:
+) -> Dict[str, Dict[str, Any]]:
     """Write per-tile LAZ files with buffer-region instances removed.
 
     Filters instances whose anchor point falls in the buffer zone on sides that
@@ -1667,6 +1667,7 @@ def write_filtered_tiles_streaming(
 
     n_tiles = len(tile_results)
     total_removed_pts = 0
+    tile_output_states: Dict[str, Dict[str, Any]] = {}
 
     for ti, result in enumerate(tile_results):
         tile_name = result.tile_name
@@ -1684,21 +1685,44 @@ def write_filtered_tiles_streaming(
                     anchor_xy = meta.highpt_xy
                 elif filter_anchor == "lowest_point":
                     anchor_xy = meta.lowpt_xy
-                else:  # "centroid" (default)
+                else:
                     anchor_xy = meta.centroid[:2]
 
                 if anchor_xy is not None and _in_buffer_region(
                     (float(anchor_xy[0]), float(anchor_xy[1])),
-                    neighbors, core_boundary,
+                    neighbors,
+                    core_boundary,
                 ):
                     ids_to_remove.add(meta.local_id)
 
         suffix = "".join(filepath.suffixes) or ".laz"
-        output_path = output_dir / f"{tile_name}{suffix}"
+        output_name = f"{tile_name}{suffix}"
+        output_path = output_dir / output_name
+        output_is_copc = output_name.endswith(".copc.laz")
+        copc_name = output_name if output_is_copc else f"{Path(output_name).stem}.copc.laz"
         print(
             f"  [{ti + 1}/{n_tiles}] {filepath.name}: "
             f"{len(result.instances)} instances, {len(ids_to_remove)} to remove",
             flush=True,
+        )
+
+        tile_state: Dict[str, Any] = {
+            "tile_name": tile_name,
+            "created": False,
+            "status": "pending",
+            "reason": None,
+            "input_point_count": 0,
+            "owned_core_point_count": 0,
+            "buffer_region_point_count": 0,
+            "output_point_count": 0,
+            "removed_point_count": 0,
+            "output_file": None,
+            "copc_output_file": None,
+        }
+        copc_path = (
+            None
+            if output_is_copc or copc_output_dir is None
+            else copc_output_dir / copc_name
         )
 
         try:
@@ -1707,7 +1731,6 @@ def write_filtered_tiles_streaming(
                 in_pf = in_header.point_format
                 copc_writer = None
 
-                # Build output header mirroring input (preserve format, scales, extra dims)
                 out_header = laspy.LasHeader(
                     point_format=in_pf.id,
                     version=in_header.version,
@@ -1720,11 +1743,11 @@ def write_filtered_tiles_streaming(
                 has_instance_dim = instance_dimension in {
                     d.name for d in in_pf.extra_dimensions
                 }
-                n_in = in_header.point_count
+                n_in = int(in_header.point_count)
                 n_out = 0
+                owned_input_points = 0
 
-                if copc_output_dir is not None:
-                    copc_path = copc_output_dir / f"{output_path.stem}.copc.laz"
+                if copc_path is not None:
                     if copc_path.exists() and copc_path.stat().st_size > 0:
                         from filter_task_support import validate_pointcloud_header
 
@@ -1751,11 +1774,21 @@ def write_filtered_tiles_streaming(
                         )
 
                 with laspy.open(
-                    str(output_path), mode="w", header=out_header,
-                    do_compress=True, laz_backend=laspy.LazBackend.LazrsParallel,
+                    str(output_path),
+                    mode="w",
+                    header=out_header,
+                    do_compress=True,
+                    laz_backend=laspy.LazBackend.LazrsParallel,
                 ) as writer:
                     for chunk in reader.chunk_iterator(chunk_size):
-                        # 1. Remove instances whose centroid/highest-point is in buffer
+                        chunk_xy = np.column_stack([
+                            np.asarray(chunk.x),
+                            np.asarray(chunk.y),
+                        ])
+                        owned_input_points += int(
+                            _owned_region_mask(chunk_xy, neighbors, core_boundary).sum()
+                        )
+
                         if ids_to_remove and has_instance_dim:
                             instance_arr = np.asarray(
                                 getattr(chunk, instance_dimension), dtype=np.int32
@@ -1764,32 +1797,53 @@ def write_filtered_tiles_streaming(
                         else:
                             keep_mask = np.ones(len(chunk), dtype=bool)
 
-                        if keep_mask.any():
-                            out_chunk = chunk[keep_mask]
-                            # 2. Remap instance IDs via global_to_merged (Phase B.5 result)
-                            if global_to_merged is not None and has_instance_dim:
-                                local_ids = np.asarray(
-                                    getattr(out_chunk, instance_dimension), dtype=np.int32
+                        if not keep_mask.any():
+                            continue
+
+                        out_chunk = chunk[keep_mask]
+                        if global_to_merged is not None and has_instance_dim:
+                            local_ids = np.asarray(
+                                getattr(out_chunk, instance_dimension), dtype=np.int32
+                            )
+                            remapped = np.array([
+                                global_to_merged.get(
+                                    result.tile_idx * TILE_OFFSET + int(lid),
+                                    int(lid),
                                 )
-                                remapped = np.array([
-                                    global_to_merged.get(
-                                        result.tile_idx * TILE_OFFSET + int(lid), int(lid)
-                                    )
-                                    for lid in local_ids
-                                ], dtype=np.int32)
-                                setattr(out_chunk, instance_dimension, remapped)
-                            writer.write_points(out_chunk)
-                            if copc_writer is not None:
-                                copc_writer.write_points(out_chunk)
-                            n_out += int(keep_mask.sum())
+                                for lid in local_ids
+                            ], dtype=np.int32)
+                            setattr(out_chunk, instance_dimension, remapped)
+                        writer.write_points(out_chunk)
+                        if copc_writer is not None:
+                            copc_writer.write_points(out_chunk)
+                        n_out += int(keep_mask.sum())
 
             removed_pts = n_in - n_out
             total_removed_pts += removed_pts
+            tile_state["input_point_count"] = n_in
+            tile_state["owned_core_point_count"] = int(owned_input_points)
+            tile_state["buffer_region_point_count"] = int(max(0, n_in - owned_input_points))
+            tile_state["output_point_count"] = int(n_out)
+            tile_state["removed_point_count"] = int(removed_pts)
             print(
                 f"    {n_in:,} pts in → {n_out:,} pts out "
                 f"({removed_pts:,} pts removed)",
                 flush=True,
             )
+
+            if owned_input_points == 0:
+                tile_state["status"] = "skipped_buffer_only"
+                tile_state["reason"] = "input_points_only_in_buffer_region"
+            elif n_in == 0:
+                tile_state["status"] = "skipped_empty_input"
+                tile_state["reason"] = "input_file_has_no_points"
+            elif n_out == 0:
+                tile_state["status"] = "skipped_empty_after_filter"
+                tile_state["reason"] = "all_points_removed_by_filter"
+            else:
+                tile_state["created"] = True
+                tile_state["status"] = "written"
+                tile_state["output_file"] = output_name
 
             if copc_writer is not None:
                 try:
@@ -1814,16 +1868,40 @@ def write_filtered_tiles_streaming(
                 finally:
                     copc_writer.cleanup()
 
+            if tile_state["created"]:
+                if output_is_copc:
+                    tile_state["copc_output_file"] = output_name
+                elif copc_path is not None and copc_path.exists() and copc_path.stat().st_size > 0:
+                    tile_state["copc_output_file"] = copc_path.name
+            else:
+                output_path.unlink(missing_ok=True)
+                if copc_path is not None:
+                    copc_path.unlink(missing_ok=True)
+                print(
+                    f"    Skipped output creation for {tile_name}: {tile_state['reason']}",
+                    flush=True,
+                )
+
         except Exception as e:
             print(f"    Error processing {tile_name}: {e}", flush=True)
             import traceback
             traceback.print_exc()
+            output_path.unlink(missing_ok=True)
+            if copc_path is not None:
+                copc_path.unlink(missing_ok=True)
+            tile_state["status"] = "error"
+            tile_state["reason"] = str(e)
 
+        tile_output_states[tile_name] = tile_state
+
+    created_tiles = sum(1 for state in tile_output_states.values() if state.get("created"))
+    skipped_tiles = len(tile_output_states) - created_tiles
     print(
-        f"\n  Done: {n_tiles} tiles written to {output_dir} "
-        f"({total_removed_pts:,} pts removed total)",
+        f"\n  Done: {created_tiles} tiles written to {output_dir}, "
+        f"{skipped_tiles} omitted ({total_removed_pts:,} pts removed total)",
         flush=True,
     )
+    return tile_output_states
 
 
 # =============================================================================

@@ -47,6 +47,7 @@ def run_tile_task(params: Parameters):
     chunk_size = params.chunk_size
     chunkwise_copc_source_creation = params.chunkwise_copc_source_creation
     output_copc_res1 = bool(params.output_copc_res1)
+    output_copc_res2 = bool(params.output_copc_res2)
 
     print("=" * 60)
     print("Running Tile Task")
@@ -65,6 +66,7 @@ def run_tile_task(params: Parameters):
     print(f"Resolution 1:             {res1}m")
     print(f"Resolution 2:             {res2}m")
     print(f"Res1 output COPC:         {output_copc_res1}")
+    print(f"Res2 output COPC:         {output_copc_res2}")
     if tiling_threshold is not None:
         print(f"Tiling threshold:         {tiling_threshold} MB")
     print(f"Chunk size:               {chunk_size:,} points")
@@ -114,6 +116,7 @@ def run_tile_task(params: Parameters):
             output_base_dir=output_dir,
             dimension_reduction=dimension_reduction,
             output_copc_res1=output_copc_res1,
+            output_copc_res2=output_copc_res2,
         )
 
         bounds_json = output_dir / "tile_bounds_tindex.json"

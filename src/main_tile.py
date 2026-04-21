@@ -324,6 +324,80 @@ def update_tile_bounds_json_from_files(
     return updated
 
 
+def _read_pointcloud_header_bounds(pointcloud_file: Path) -> Tuple[float, float, float, float]:
+    """Read XY header bounds from a LAZ/LAS/COPC file."""
+    import laspy
+
+    if not pointcloud_file.exists():
+        raise FileNotFoundError(f"Point cloud file not found: {pointcloud_file}")
+
+    open_kwargs = {}
+    laz_backend = _laspy_laz_backend()
+    if laz_backend is not None:
+        open_kwargs["laz_backend"] = laz_backend
+
+    try:
+        with laspy.open(str(pointcloud_file), **open_kwargs) as las:
+            return (
+                float(las.header.x_min),
+                float(las.header.x_max),
+                float(las.header.y_min),
+                float(las.header.y_max),
+            )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not read header bounds from {pointcloud_file}: {exc}"
+        ) from exc
+
+
+def rewrite_tile_bounds_json_for_single_file_skip(
+    tile_bounds_json: Path,
+    pointcloud_file: Path,
+) -> Dict[str, float]:
+    """
+    Rewrite tile_bounds_tindex.json to one tile based on actual file bounds.
+
+    This is used when tiling is intentionally skipped for a single small file.
+    """
+    if not tile_bounds_json.exists():
+        raise FileNotFoundError(f"tile_bounds_tindex.json not found: {tile_bounds_json}")
+
+    with tile_bounds_json.open() as f:
+        data = json.load(f)
+
+    minx, maxx, miny, maxy = _read_pointcloud_header_bounds(pointcloud_file)
+    actual_bounds = [[minx, maxx], [miny, maxy]]
+    extent = {"minx": minx, "miny": miny, "maxx": maxx, "maxy": maxy}
+
+    template_tile = {}
+    tiles = data.get("tiles", [])
+    if isinstance(tiles, list) and tiles:
+        template_tile = dict(tiles[0])
+
+    single_tile = dict(template_tile)
+    single_tile["col"] = 0
+    single_tile["row"] = 0
+    single_tile["core"] = actual_bounds
+    single_tile["planned_bounds"] = actual_bounds
+    single_tile["bounds"] = actual_bounds
+    single_tile["actual_bounds"] = actual_bounds
+    data["tiles"] = [single_tile]
+
+    data["geo_extent"] = extent
+    data["proj_extent"] = extent
+    data["grid_bounds"] = {
+        "xmin": minx,
+        "xmax": maxx,
+        "ymin": miny,
+        "ymax": maxy,
+    }
+
+    with tile_bounds_json.open("w") as f:
+        json.dump(data, f, indent=2)
+
+    return extent
+
+
 def get_source_files_from_tindex(tindex_file: Path) -> List[str]:
     """Get list of source point cloud files (LAZ/LAS paths) from tindex database."""
     import sqlite3
@@ -1505,6 +1579,17 @@ def run_tiling_pipeline(
             print(f"  ✓ Prepared {out_copc.name}")
         else:
             print(f"  Using existing {out_copc.name}")
+
+        rewritten_extent = rewrite_tile_bounds_json_for_single_file_skip(bounds_json, out_copc)
+        print(
+            "  Rewrote tile_bounds_tindex.json for single-file skip "
+            f"to bounds x=[{rewritten_extent['minx']:.3f}, {rewritten_extent['maxx']:.3f}] "
+            f"y=[{rewritten_extent['miny']:.3f}, {rewritten_extent['maxy']:.3f}]"
+        )
+        plot_tiles_and_copc.plot_extents(
+            tindex_file, bounds_json, output_dir / "overview_copc_tiles.png"
+        )
+        print("  Regenerated overview_copc_tiles.png with corrected single-tile bounds")
         print(f"  Returning COPC directory for direct subsampling")
         print("=" * 60)
         return copc_single_dir

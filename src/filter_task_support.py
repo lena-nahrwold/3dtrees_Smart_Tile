@@ -739,3 +739,51 @@ def _fraction_in_bounds(
     mn_x, mx_x, mn_y, mx_y = bounds
     inside = sum(1 for x, y in points if mn_x <= x <= mx_x and mn_y <= y <= mx_y)
     return inside / len(points)
+
+
+def write_filtered_tile_manifest(
+    *,
+    output_dir: Path,
+    tile_output_states: Mapping[str, Mapping[str, object]],
+    tile_bounds_json: Optional[Path] = None,
+) -> Tuple[Path, Optional[Path]]:
+    """Persist filtered-tile creation state and optionally annotate a bounds-JSON copy."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest_path = output_dir / "filtered_tile_manifest.json"
+    ordered_states = [
+        dict(tile_output_states[tile_name], tile_name=tile_name)
+        for tile_name in sorted(tile_output_states)
+    ]
+    manifest_payload = {
+        "manifest_version": 1,
+        "tile_count": len(ordered_states),
+        "tiles": ordered_states,
+    }
+    manifest_path.write_text(json.dumps(manifest_payload, indent=2) + "\n")
+
+    bounds_copy_path: Optional[Path] = None
+    if tile_bounds_json is not None and Path(tile_bounds_json).exists():
+        bounds_copy_path = output_dir / Path(tile_bounds_json).name
+        if bounds_copy_path.resolve() == Path(tile_bounds_json).resolve():
+            bounds_copy_path = output_dir / "filtered_tile_bounds_tindex.json"
+        with Path(tile_bounds_json).open() as fh:
+            bounds_payload = json.load(fh)
+
+        for tile in bounds_payload.get("tiles", []):
+            if "col" not in tile or "row" not in tile:
+                continue
+            tile_name = f"c{int(tile['col']):02d}_r{int(tile['row']):02d}"
+            state = tile_output_states.get(tile_name)
+            if state is None:
+                continue
+            tile["filter_output"] = dict(state)
+
+        bounds_payload["filtered_tile_manifest"] = {
+            "manifest_path": manifest_path.name,
+            "tile_status_field": "filter_output",
+        }
+        bounds_copy_path.write_text(json.dumps(bounds_payload, indent=2) + "\n")
+
+    return manifest_path, bounds_copy_path

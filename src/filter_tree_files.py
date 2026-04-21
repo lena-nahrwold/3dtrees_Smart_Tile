@@ -16,6 +16,8 @@ def update_trees_files_with_global_ids(
     tree_texts_by_input_file,
     trees_output_dir,
     tile_offset: int,
+    *,
+    included_tile_names=None,
 ):
     """
     Write filtered tree sidecars into a dedicated tree-files output directory.
@@ -34,6 +36,9 @@ def update_trees_files_with_global_ids(
     n_written = 0
     for result in tile_results:
         tile_name = result.tile_name
+        if included_tile_names is not None and tile_name not in included_tile_names:
+            print(f"  Skipping tree sidecars for omitted tile {tile_name}")
+            continue
         source_tree_files = tree_texts_by_input_file.get(Path(result.filepath), {})
         if not source_tree_files:
             print(f"  No tree text file for tile {tile_name}, skipping")

@@ -28,6 +28,7 @@ from filter_task_support import (
     prepare_filtered_outputs_for_remap,
     resolve_filter_chunk_size,
     resolve_filter_input_paths,
+    write_filtered_tile_manifest,
 )
 from merge_tiles import (
     build_neighbor_graph_from_bounds_json,
@@ -506,7 +507,7 @@ def run_filter_task(params: Parameters, deps: FilterTaskDependencies):
             chunk_size=max(100_000, chunk_size // 4),
         )
 
-    write_filtered_tiles_streaming(
+    tile_output_states = write_filtered_tiles_streaming(
         tile_results=tile_results,
         neighbors_by_tile=neighbors_by_tile,
         core_bounds_by_tile=core_bounds_by_tile,
@@ -518,6 +519,19 @@ def run_filter_task(params: Parameters, deps: FilterTaskDependencies):
         filter_anchor=params.filter_anchor,
         global_to_merged=global_to_merged,
     )
+    created_tile_names = {
+        tile_name
+        for tile_name, state in tile_output_states.items()
+        if state.get("created")
+    }
+    manifest_path, bounds_copy_path = write_filtered_tile_manifest(
+        output_dir=output_dir,
+        tile_output_states=tile_output_states,
+        tile_bounds_json=tile_bounds_json,
+    )
+    print(f"  Tile manifest:         {manifest_path}", flush=True)
+    if bounds_copy_path is not None:
+        print(f"  Filtered bounds JSON:  {bounds_copy_path}", flush=True)
 
     filtered_remap_source = prepare_filtered_outputs_for_remap(
         source_collection=filtered_output_dir,
@@ -531,6 +545,12 @@ def run_filter_task(params: Parameters, deps: FilterTaskDependencies):
         f"[{describe_collection_source_mode(Path(filtered_remap_source))}]",
         flush=True,
     )
+    remap_source_files = collect_pointcloud_files(Path(filtered_remap_source))
+    if not remap_source_files:
+        print(
+            "  Note: no filtered point-cloud outputs were written; remap targets will be skipped.",
+            flush=True,
+        )
 
     filtered_trees_dir = output_dir / "filtered_trees"
     print(f"\n{'=' * 60}")
@@ -544,6 +564,7 @@ def run_filter_task(params: Parameters, deps: FilterTaskDependencies):
         tree_texts_by_input_file=tree_texts_by_input_file,
         trees_output_dir=filtered_trees_dir,
         tile_offset=TILE_OFFSET,
+        included_tile_names=created_tile_names,
     )
     # Tree sources already tied to a processed tile are rewritten in-place above.
     # Do not copy them again (same basename would become *_2.txt and break Galaxy outputs).
@@ -586,12 +607,16 @@ def run_filter_task(params: Parameters, deps: FilterTaskDependencies):
     print("Copying mesh sidecars")
     print(f"{'=' * 60}")
     copied_mesh = copy_mesh_sidecars_for_tiles(
-        tile_name_by_path=tile_name_by_path,
+        tile_name_by_path={
+            path: tile_name
+            for path, tile_name in tile_name_by_path.items()
+            if tile_name in created_tile_names
+        },
         destination_dir=filtered_output_dir,
     )
     print(f"  Mesh sidecar files copied: {copied_mesh}")
 
-    if getattr(params, "subsampled_target_folder", None) and not remap_merge_effective:
+    if getattr(params, "subsampled_target_folder", None) and not remap_merge_effective and remap_source_files:
         sub_target = Path(params.subsampled_target_folder)
         sub_output = output_dir / "subsampled_with_predictions"
         print(f"\n{'=' * 60}")
@@ -627,7 +652,7 @@ def run_filter_task(params: Parameters, deps: FilterTaskDependencies):
                     print(f"  Concatenating {len(out_files)} subsampled outputs -> {merged_all.name}", flush=True)
                     _concat_laz_files(out_files, merged_all, chunk_size=chunk_size)
 
-    if remap_merge_effective:
+    if remap_merge_effective and remap_source_files:
         if not params.original_input_dir:
             print("Error: --original-input-dir is required when --remap-merge is enabled")
             sys.exit(1)
@@ -645,6 +670,11 @@ def run_filter_task(params: Parameters, deps: FilterTaskDependencies):
             }
         )
         deps.run_remap_task(remap_params)
+    elif remap_merge_effective:
+        print(
+            "  Note: remap-merge requested, but no filtered tile outputs were written; skipping remap tail.",
+            flush=True,
+        )
 
     print()
     print("=" * 60)
@@ -664,6 +694,9 @@ def run_filter_task(params: Parameters, deps: FilterTaskDependencies):
         filtered_output_dir=filtered_output_dir,
         filtered_remap_source=Path(filtered_remap_source),
         filtered_trees_dir=filtered_trees_dir,
+        tile_output_states=tile_output_states,
+        filtered_tile_manifest=manifest_path,
+        filtered_tile_bounds_json=bounds_copy_path,
         instance_dimension=instance_dimension,
         merge_chunk_size=chunk_size,
     )

@@ -700,6 +700,7 @@ def run_subsample_pipeline(
     output_base_dir: Optional[Path] = None,
     dimension_reduction: bool = True,
     output_copc_res1: bool = True,
+    output_copc_res2: bool = False,
 ) -> Tuple[Path, Path]:
     """
     Run the complete subsampling pipeline.
@@ -722,6 +723,7 @@ def run_subsample_pipeline(
         output_base_dir: Base directory for output (default: parent of tiles_dir)
         dimension_reduction: If True, write only standard dimensions (minimal); if False, keep extra_dims (e.g. PredInstance).
         output_copc_res1: If True, res1 outputs are written as COPC (".copc.laz").
+        output_copc_res2: If True, res2 outputs are written as COPC (".copc.laz").
     
     Returns:
         Tuple of (subsampled_res1_dir, subsampled_res2_dir)
@@ -756,6 +758,7 @@ def run_subsample_pipeline(
     print(f"Threads (chunks per file): {num_threads}")
     print(f"Dimension reduction: {dimension_reduction} ({'minimal (standard dims only)' if dimension_reduction else 'keep all (extra_dims preserved)'})")
     print(f"Resolution 1 output: {'COPC (.copc.laz)' if output_copc_res1 else 'LAZ (.laz)'}")
+    print(f"Resolution 2 output: {'COPC (.copc.laz)' if output_copc_res2 else 'LAZ (.laz)'}")
     print()
     
     # Step 1: Subsample to resolution 1
@@ -794,7 +797,7 @@ def run_subsample_pipeline(
         num_threads=num_threads,
         output_prefix=output_prefix,
         dimension_reduction=dimension_reduction,
-        output_copc=False,
+        output_copc=output_copc_res2,
     )
     
     if not res2_files:
@@ -862,6 +865,18 @@ def main():
         default=None,
         help="Optional prefix for output filenames"
     )
+    parser.add_argument(
+        "--output-copc-res1",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Write resolution-1 outputs as COPC (.copc.laz).",
+    )
+    parser.add_argument(
+        "--output-copc-res2",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Write resolution-2 outputs as COPC (.copc.laz).",
+    )
     
     args = parser.parse_args()
     
@@ -878,7 +893,9 @@ def main():
             res2=args.res2,
             num_cores=args.num_cores,
             num_threads=args.num_threads,
-            output_prefix=args.output_prefix
+            output_prefix=args.output_prefix,
+            output_copc_res1=args.output_copc_res1,
+            output_copc_res2=args.output_copc_res2,
         )
         print(f"\nSubsampled files ready:")
         print(f"  Resolution 1: {res1_dir}")
